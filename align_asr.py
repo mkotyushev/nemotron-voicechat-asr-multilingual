@@ -55,7 +55,7 @@ Usage
     python align_asr.py \
         --asr-dir   /path/to/asr-multilingual \
         --container /path/to/nemotron_voicechat_11b-Q8_0.gguf \
-        --audio     /path/to/LibriSpeech/dev-clean \
+        --manifest  /path/to/shared/manifests/librispeech.json \
         -o          /path/to/asr-multilingual-aligned
 
 What comes out is an ordinary checkpoint directory: the upstream encoder tensors
@@ -82,7 +82,8 @@ import numpy as np
 import torch
 
 from asr_align import (
-    data, encoder as encoder_module, export, features, hooks, interface, transport,
+    data, encoder as encoder_module, export, features, hooks, interface, manifests,
+    transport,
 )
 from asr_align.weights import load_asr, load_container, load_prompt_projector
 
@@ -102,8 +103,11 @@ def main() -> None:
                     help="the encoder to align: config.json and model.safetensors")
     ap.add_argument("--container", type=Path, required=True,
                     help="nemotron_voicechat_11b-*.gguf: the target encoder, proj and the featurizer")
-    ap.add_argument("--audio", type=Path, required=True,
-                    help="directory of English calibration speech (LibriSpeech dev-clean)")
+    audio_source = ap.add_mutually_exclusive_group(required=True)
+    audio_source.add_argument("--manifest", type=Path,
+                              help="frozen LibriSpeech manifest from shared_setup.py")
+    audio_source.add_argument("--audio", type=Path,
+                              help="unfrozen calibration directory (legacy exploratory runs only)")
     ap.add_argument("--audio-glob", default="**/*.flac")
     ap.add_argument("-o", "--output", type=Path, required=True,
                     help="checkpoint directory to write")
@@ -175,15 +179,38 @@ def main() -> None:
             prompt_head = {k: v.to(device) for k, v in prompt_head.items()}
 
     # --------------------------------------------------------------- the data
-    clips = data.find_clips(
-        args.audio, seconds=args.seconds, limit=args.clips, seed=args.seed,
-        pattern=args.audio_glob,
-    )
-    fit_clips, eval_clips = data.split(clips, args.holdout)
-    logger.info(
-        "calibration: %d clips of %.1f s, %d fit / %d held out",
-        len(clips), args.seconds, len(fit_clips), len(eval_clips),
-    )
+    manifest_sha256 = None
+    if args.manifest is not None:
+        frozen = manifests.load_manifest(args.manifest)
+        manifests.validate_librispeech_manifest(frozen)
+        manifests.assert_model_selection_source("LibriSpeech", "map_train")
+        manifests.assert_model_selection_source("LibriSpeech", "validation")
+        frozen_clips = data.from_frozen_manifest(args.manifest)
+        fit_clips = frozen_clips["map_train"]
+        eval_clips = frozen_clips["validation"]
+        manifest_sha256 = frozen["manifest_sha256"]
+        calibration_seconds = float(frozen["crop_seconds"])
+        audio_label = str(args.manifest)
+        logger.info(
+            "calibration manifest: %d map-train / %d validation clips; "
+            "%d reserved test clips are untouched",
+            len(fit_clips), len(eval_clips), len(frozen_clips["test"]),
+        )
+    else:
+        logger.warning(
+            "--audio creates an ephemeral split; shared comparisons must use --manifest"
+        )
+        clips = data.find_clips(
+            args.audio, seconds=args.seconds, limit=args.clips, seed=args.seed,
+            pattern=args.audio_glob,
+        )
+        fit_clips, eval_clips = data.split(clips, args.holdout)
+        calibration_seconds = args.seconds
+        audio_label = str(args.audio)
+        logger.info(
+            "calibration: %d clips of %.1f s, %d fit / %d held out",
+            len(clips), args.seconds, len(fit_clips), len(eval_clips),
+        )
 
     # Featurized once and kept: the encoders are run over the fit set three
     # times (interface moments, stream statistics, head statistics) and the
@@ -355,9 +382,11 @@ def main() -> None:
         "detail": {k: v for k, v in chosen.detail.items()},
         "source": str(args.asr_dir),
         "container": str(args.container),
-        "audio": str(args.audio),
-        "clips": len(clips),
-        "seconds": args.seconds,
+        "audio": audio_label,
+        "manifest": str(args.manifest) if args.manifest is not None else None,
+        "manifest_sha256": manifest_sha256,
+        "clips": len(fit_clips) + len(eval_clips),
+        "seconds": calibration_seconds,
         "fit_frames": hidden_moments.count,
         "eval_frames": int(eval_x.shape[0]),
         "source_normalize": bool(args.source_normalize),

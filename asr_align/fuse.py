@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import torch
 
+from .experiments import candidate as strict_candidate
+from .experiments import task_vector, validate_encoder_triplet
 from .transport import TransportOperators, concatenated_operators, expanded_operators, identity_operators
 
 RESIDUAL_GROUP = "residual"
@@ -131,16 +133,15 @@ def task_arithmetic(
     """`base + weight * (descendant - ancestor)`, tensor by tensor.
 
     All three must already be in one basis; run :func:`rebase` first if the
-    transport plans say they are not.
+    transport plans say they are not.  Arithmetic is deliberately limited to
+    canonical ``encoder.*`` tensors and delegated to the shared strict path,
+    which rejects missing keys, shape mismatches, broadcasting and non-finite
+    values and always computes in F32.
     """
 
-    missing = set(base) ^ set(ancestor) | set(base) ^ set(descendant)
-    if missing:
-        raise ValueError(f"the three encoders disagree on {len(missing)} tensors, e.g. {sorted(missing)[:4]}")
-    return {
-        key: base[key] + weight * (descendant[key] - ancestor[key])
-        for key in base
-    }
+    states = validate_encoder_triplet(ancestor, base, descendant)
+    delta = task_vector(states["E"], states["F"])
+    return strict_candidate(states["M"], delta, weight)
 
 
 def interpolate(

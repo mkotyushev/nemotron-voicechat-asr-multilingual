@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "seed": 0,
+  "container_reader_work": ".cache/llama-voicechat.cpp",
+  "checkpoints": {
+    "E": {
+      "name": "PT_EN",
+      "kind": "asr",
+      "repo_id": "nvidia/nemotron-speech-streaming-en-0.6b",
+      "revision": "REPLACE_WITH_PINNED_REVISION",
+      "path": "../nemotron-voicechat-realtime-gguf/models/asr-en"
+    },
+    "M": {
+      "name": "PT_ML",
+      "kind": "asr",
+      "repo_id": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "revision": "REPLACE_WITH_PINNED_REVISION",
+      "path": "../nemotron-voicechat-realtime-gguf/models/asr-multilingual"
+    },
+    "F": {
+      "name": "FT_EN",
+      "kind": "voicechat_container",
+      "repo_id": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B",
+      "revision": "REPLACE_WITH_PINNED_REVISION",
+      "path": "../nemotron-voicechat-realtime-gguf/models/nemotron_voicechat_11b-Q8_0.gguf",
+      "ancestor": {
+        "repo_id": "nvidia/nemotron-speech-streaming-en-0.6b",
+        "revision": "REPLACE_WITH_THE_SAME_PT_EN_REVISION",
+        "evidence": "REPLACE_WITH_AUDITABLE_MODEL_CARD_OR_RELEASE_NOTE"
+      }
+    }
+  },
+  "precision": {
+    "arithmetic": "float32",
+    "quantization_stage": "final_artifact_only",
+    "deployment_quantization": "Q8_0"
+  },
+  "data": {
+    "librispeech": {
+      "root": ".cache/data/LibriSpeech/dev-clean",
+      "seconds": 6.0,
+      "pattern": "**/*.flac",
+      "speaker_split_ratios": [0.6, 0.2, 0.2],
+      "max_clips_per_split": null
+    },
+    "fleurs": {
+      "root": ".cache/data/fleurs",
+      "reference": "en_us",
+      "languages": ["fr_fr", "de_de", "ru_ru"],
+      "split": "dev",
+      "max_sentences_per_language": null
+    }
+  }
+}

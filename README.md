@@ -30,6 +30,10 @@ checkpoint. It is not evidence that the model is generally multilingual.
 | Path | Purpose |
 |---|---|
 | `align_asr.py` | fit, evaluate, and export an interface map |
+| `shared_setup.py` | pin checkpoints, validate arithmetic, and freeze all shared manifests |
+| `asr_align/experiments.py` | checkpoint roles, strict F32 encoder arithmetic, and provenance |
+| `asr_align/manifests.py` | immutable speaker/sentence/take manifests |
+| `asr_align/evaluation.py` | common comparison metrics, diagnostics, and paired intervals |
 | `asr_align/encoder.py` | PyTorch port of the runtime FastConformer graph |
 | `asr_align/features.py` | matching audio featurizer |
 | `asr_align/interface.py` | interface-map fits and held-out scoring |
@@ -45,9 +49,11 @@ checkpoint. It is not evidence that the model is generally multilingual.
 
 The experiment needs three model artifacts:
 
-1. The Q8_0 VoiceChat source container.
-2. `nvidia/nemotron-3.5-asr-streaming-0.6b`.
-3. The tokenizer files used by the server conversion.
+1. `E = PT_EN`: `nvidia/nemotron-speech-streaming-en-0.6b`.
+2. `M = PT_ML`: `nvidia/nemotron-3.5-asr-streaming-0.6b`.
+3. `F = FT_EN`: the VoiceChat source container.
+
+The server conversion additionally needs its tokenizer files.
 
 The sibling server repo can download them. In its `.env`, temporarily set:
 
@@ -75,6 +81,40 @@ The setup script creates a separate CUDA PyTorch environment, downloads
 LibriSpeech `dev-clean`, and prepares the pinned runtime reader used for parity
 checks. It does not modify the server environment.
 
+## Frozen shared experiment setup
+
+Before running comparisons, copy the shared spec into the ignored cache area,
+replace every checkpoint revision with an immutable revision, cite the source
+that identifies `PT_EN` as the intended `FT_EN` ancestor, and point it at a
+local FLEURS tree:
+
+```bash
+cp shared_setup.example.json .cache/shared_setup.local.json
+# edit .cache/shared_setup.local.json
+.venv-align/bin/python shared_setup.py \
+    --spec .cache/shared_setup.local.json \
+    --output .cache/experiments/shared-v1
+```
+
+This command fails closed on a movable or missing revision, wrong model role,
+lineage mismatch, missing/non-finite/broadcastable tensors, changed runtime
+configuration, speaker leakage, reused English FLEURS takes, or an attempt to
+replace an already-frozen setup. It writes:
+
+```text
+.cache/experiments/shared-v1/
+  shared_setup.json          checkpoint revisions, hashes, configs and policies
+  manifests/librispeech.json
+  manifests/fleurs.json
+```
+
+The LibriSpeech manifest has speaker-disjoint `map_train`, `validation`, and
+reserved `test` splits. FLEURS is evaluation-only. Every audio record is pinned
+by path, byte count, and SHA-256; consumers verify those values before a run.
+All model arithmetic is over exact canonical `encoder.*` tensors in F32, using
+the fixed lambda sweep `0, .25, .5, .75, 1` with `1` as the primary endpoint.
+Only final exported artifacts may be quantized.
+
 Run the fit with:
 
 ```bash
@@ -82,7 +122,7 @@ set -a; source .env; set +a
 .venv-align/bin/python align_asr.py \
     --asr-dir   "$MODEL_DIR/asr-multilingual" \
     --container "$MODEL_DIR/nemotron_voicechat_11b-Q8_0.gguf" \
-    --audio     "$ALIGN_DATA/LibriSpeech/dev-clean" \
+    --manifest  .cache/experiments/shared-v1/manifests/librispeech.json \
     --work      "$CONVERT_WORK" \
     -o          "$MODEL_DIR/asr-multilingual-aligned"
 ```
@@ -90,6 +130,12 @@ set -a; source .env; set +a
 The output directory is a standalone checkpoint. It includes the multilingual
 encoder, the fitted VoiceChat projection, and the mel-featurizer tensors needed
 by the server converter.
+
+All comparisons emit records through `asr_align.evaluation.evaluate_candidate`.
+That contract always includes English VoiceChat-space R²/cosine, the three
+retrieval views, top-1/top-5/MRR/median rank/hit count/N, paired bootstrap
+intervals against `PT_ML`, embedding mean/norm diagnostics, manifest hashes,
+and an explicit pre- or post-quantization stage.
 
 ## Why the encoder cannot simply be swapped
 

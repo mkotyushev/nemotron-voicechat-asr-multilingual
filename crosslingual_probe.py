@@ -39,10 +39,9 @@ ranking is decided by noise.
 Usage
 -----
     python crosslingual_probe.py \
-        --fleurs    /path/to/fleurs \
+        --manifest  /path/to/shared/manifests/fleurs.json \
         --container /path/to/nemotron_voicechat_11b-Q8_0.gguf \
-        --asr-dir   /path/to/asr-multilingual-aligned \
-        --languages fr_fr ru_ru de_de
+        --asr-dir   /path/to/asr-multilingual-aligned
 """
 
 from __future__ import annotations
@@ -57,7 +56,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from asr_align import encoder as encoder_module, features
+from asr_align import encoder as encoder_module, evaluation, features, manifests
 from asr_align.weights import load_asr, load_container
 
 logger = logging.getLogger("crosslingual")
@@ -69,14 +68,19 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--fleurs", type=Path, required=True,
-                    help="directory holding data/<lang>/dev.tsv and x/<lang>/dev/*.wav")
+    corpus = ap.add_mutually_exclusive_group(required=True)
+    corpus.add_argument("--manifest", type=Path,
+                        help="frozen FLEURS sentence/take manifest from shared_setup.py")
+    corpus.add_argument("--fleurs", type=Path,
+                        help="unfrozen FLEURS directory (legacy exploratory runs only)")
     ap.add_argument("--container", type=Path, required=True)
     ap.add_argument("--asr-dir", type=Path, required=True,
                     help="the aligned checkpoint align_asr.py wrote; its own proj is "
                          "the aligned probe, and the container's is the unaligned one")
-    ap.add_argument("--languages", nargs="+", default=["fr_fr", "ru_ru", "de_de"])
-    ap.add_argument("--reference", default="en_us")
+    ap.add_argument("--languages", nargs="+", default=None,
+                    help="manifest languages to run (default: every frozen language)")
+    ap.add_argument("--reference", default=None,
+                    help="reference locale for an unfrozen run (default en_us)")
     ap.add_argument("--work", type=Path, default=DEFAULT_WORK)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("-o", "--output", type=Path, default=None, help="write the table as json")
@@ -104,7 +108,34 @@ def main() -> None:
         logger.info("alignment : %s (map %s)", args.asr_dir,
                     json.loads(report.read_text()).get("map", "?"))
 
-    takes = {lang: _takes(args.fleurs, lang) for lang in [args.reference] + args.languages}
+    frozen = None
+    manifest_sha256 = None
+    if args.manifest is not None:
+        frozen = manifests.load_manifest(args.manifest)
+        manifests.validate_fleurs_manifest(frozen)
+        fleurs_root = Path(frozen["root"])
+        manifests.verify_audio_files(frozen, root=fleurs_root)
+        reference_language = str(frozen["reference_language"])
+        languages = list(args.languages or frozen["languages"])
+        unknown = set(languages) - set(frozen["languages"])
+        if unknown:
+            raise SystemExit(f"languages are not in the frozen manifest: {sorted(unknown)}")
+        if args.reference is not None and args.reference != reference_language:
+            raise SystemExit(
+                f"--reference {args.reference} differs from frozen {reference_language}"
+            )
+        manifest_sha256 = frozen["manifest_sha256"]
+    else:
+        logger.warning(
+            "--fleurs rediscovers takes; shared comparisons must use --manifest"
+        )
+        fleurs_root = args.fleurs
+        reference_language = args.reference or "en_us"
+        languages = list(args.languages or ["fr_fr", "ru_ru", "de_de"])
+        takes = {
+            lang: _takes(fleurs_root, lang)
+            for lang in [reference_language] + languages
+        }
 
     @torch.no_grad()
     def pooled(model, paths: list[Path]) -> torch.Tensor:
@@ -126,39 +157,69 @@ def main() -> None:
         return (hidden @ projection[0].t() + projection[1]).double().cpu().numpy()
 
     table = []
-    for lang in args.languages:
-        shared = sorted(set(takes[args.reference]) & set(takes[lang]))
-        if not shared:
-            logger.warning("no shared sentences for %s", lang)
-            continue
-        logger.info("%s: %d sentences shared with %s", lang, len(shared), args.reference)
+    for lang in languages:
+        if frozen is not None:
+            pairs = frozen["pairs"][lang]
+            shared = [row["sentence_id"] for row in pairs]
+            foreign = [manifests.resolve_take(fleurs_root, row["foreign_query"]) for row in pairs]
+            reference_paths = [
+                manifests.resolve_take(fleurs_root, row["english_reference"]) for row in pairs
+            ]
+            english_query_paths = [
+                manifests.resolve_take(fleurs_root, row["english_query"]) for row in pairs
+            ]
+        else:
+            shared = sorted(
+                sentence_id
+                for sentence_id in set(takes[reference_language]) & set(takes[lang])
+                if len(takes[reference_language][sentence_id]) >= 2
+            )
+            if not shared:
+                logger.warning("no shared sentences with two English takes for %s", lang)
+                continue
+            foreign = [takes[lang][sentence_id][0] for sentence_id in shared]
+            reference_paths = [
+                takes[reference_language][sentence_id][0] for sentence_id in shared
+            ]
+            english_query_paths = [
+                takes[reference_language][sentence_id][1] for sentence_id in shared
+            ]
+        logger.info("%s: %d sentences shared with %s", lang, len(shared), reference_language)
 
-        foreign = [takes[lang][i][0] for i in shared]
-        reference = project(pooled(container, [takes[args.reference][i][0] for i in shared]), proj)
+        reference = project(pooled(container, reference_paths), proj)
         swapped_hidden = pooled(swapped, foreign)
         probes = {
             "en (second take)": project(
-                pooled(container, [takes[args.reference][i][-1] for i in shared]), proj
+                pooled(container, english_query_paths), proj
             ),
             "container": project(pooled(container, foreign), proj),
             "multilingual": project(swapped_hidden, proj),
             "multilingual+map": project(swapped_hidden, aligned),
         }
         for name, probe in probes.items():
-            top1, top5, median = _retrieval(probe, reference)
+            metrics = evaluation.retrieval_metrics(probe, reference, centered=True)
             row = {
                 "language": lang, "probe": name, "n": len(shared),
-                "top1": top1, "top5": top5, "median_rank": median,
+                **metrics,
                 "chance_top1": 1.0 / len(shared),
             }
             table.append(row)
             logger.info(
-                "  %-18s top1 %5.1f%%  top5 %5.1f%%  median rank %5.1f  (chance %4.1f%%)",
-                name, 100 * top1, 100 * top5, median, 100 * row["chance_top1"],
+                "  %-18s top1 %5.1f%%  top5 %5.1f%%  MRR %.3f  median rank %5.1f  "
+                "(%d/%d hits; chance %4.1f%%)",
+                name, 100 * metrics["top1"], 100 * metrics["top5"], metrics["mrr"],
+                metrics["median_rank"], metrics["hit_count"], metrics["n"],
+                100 * row["chance_top1"],
             )
 
     if args.output:
-        args.output.write_text(json.dumps(table, indent=2))
+        report = {
+            "schema_version": evaluation.RESULT_SCHEMA_VERSION,
+            "evaluation": "historical_centered_fleurs_retrieval",
+            "manifest_sha256": manifest_sha256,
+            "rows": table,
+        }
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
         logger.info("wrote %s", args.output)
 
 
@@ -194,15 +255,8 @@ def _retrieval(probe: np.ndarray, reference: np.ndarray) -> tuple[float, float, 
     and the ordering noise.
     """
 
-    probe = probe - probe.mean(axis=0, keepdims=True)
-    reference = reference - reference.mean(axis=0, keepdims=True)
-    probe /= np.linalg.norm(probe, axis=1, keepdims=True).clip(1e-12)
-    reference /= np.linalg.norm(reference, axis=1, keepdims=True).clip(1e-12)
-
-    similarity = probe @ reference.T
-    truth = similarity.diagonal()[:, None]
-    ranks = (similarity > truth).sum(axis=1) + 1
-    return float((ranks == 1).mean()), float((ranks <= 5).mean()), float(np.median(ranks))
+    metrics = evaluation.retrieval_metrics(probe, reference, centered=True)
+    return metrics["top1"], metrics["top5"], metrics["median_rank"]
 
 
 if __name__ == "__main__":

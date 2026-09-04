@@ -121,3 +121,32 @@ def split(clips: list[Clip], holdout: float = 0.2) -> tuple[list[Clip], list[Cli
             "collect more calibration audio"
         )
     return fit, evaluate
+
+
+def from_frozen_manifest(
+    path: Path, *, root: Path | None = None
+) -> dict[str, list[Clip]]:
+    """Load the exact speaker-disjoint crops frozen by shared setup.
+
+    The reserved ``test`` split is returned to make its existence explicit, but
+    fitters should consume only ``map_train`` and ``validation``.  The manifest
+    content hash and split disjointness are verified before any audio is read.
+    """
+
+    from .manifests import load_manifest, validate_librispeech_manifest, verify_audio_files
+
+    payload = load_manifest(path)
+    validate_librispeech_manifest(payload)
+    source_root = (root or Path(payload["root"])).resolve()
+    verify_audio_files(payload, root=source_root)
+    result: dict[str, list[Clip]] = {}
+    for split_name, records in payload["splits"].items():
+        clips = []
+        for record in records:
+            relative = Path(record["path"])
+            resolved = source_root / relative
+            if not resolved.is_file():
+                raise SystemExit(f"frozen LibriSpeech recording is missing: {resolved}")
+            clips.append(Clip(resolved, int(record["offset"]), int(record["n_samples"])))
+        result[split_name] = clips
+    return result
