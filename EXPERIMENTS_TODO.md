@@ -7,7 +7,8 @@ Use this as the implementation and experiment checklist. Complete each compariso
 - [x] Verify that `PT_EN` is the intended ancestor of `FT_EN`.
 - [x] Restrict arithmetic to the shared canonical `encoder.*` tensors.
 - [x] Verify identical tensor keys and shapes; reject broadcasting, non-finite values, or missing tensors.
-- [x] Perform arithmetic in F32 and quantize only final artifacts.
+- [x] Load all arithmetic/reference sources from original safetensors, perform
+  arithmetic in F32, and quantize only final deployment artifacts.
 - [x] Make every candidate inherit the `PT_ML` runtime configuration.
 - [x] Freeze speaker-disjoint LibriSpeech map-training, validation, and test manifests.
 - [x] Freeze FLEURS sentence/take manifests and require distinct English reference and query recordings.
@@ -28,18 +29,22 @@ running; the command rejects unpinned/mismatched checkpoints or changed data.
 
 ## 1. `PT_ML` baseline
 
-- [ ] Load the unmodified `PT_ML` encoder.
-- [ ] Attach the original VoiceChat/`FT_EN` projection without an alignment map.
-- [ ] Run a deterministic forward-pass sanity check.
-- [ ] Export and reload a pass-through copy.
-- [ ] Verify that the pass-through artifact matches the original model before quantization.
-- [ ] Measure any change caused by export and deployment quantization.
-- [ ] Reproduce the historical French, German, and Russian FLEURS results using the frozen manifest.
-- [ ] Run the complete shared evaluation.
-- [ ] Save pooled embeddings and per-layer activations for reuse.
-- [ ] Record this result as the reference against which comparisons 2–5 are measured.
+- [x] Load the unmodified `PT_ML` encoder.
+- [x] Attach the original VoiceChat/`FT_EN` projection without an alignment map.
+- [x] Run a deterministic forward-pass sanity check.
+- [x] Export and reload a pass-through copy.
+- [x] Verify that the pass-through artifact matches the original model before quantization.
+- [x] Measure any change caused by export and deployment quantization.
+- [x] Reproduce the historical French, German, and Russian FLEURS results using the frozen manifest.
+- [x] Run the complete shared evaluation.
+- [x] Save pooled embeddings and per-layer activations for reuse.
+- [x] Record this result as the reference against which comparisons 2–5 are measured.
 
 Done when the baseline is reproducible and its artifact, manifest, metrics, and hashes are recorded.
+
+Implemented by `pt_ml_baseline.py` and `asr_align/baseline.py`. The boxes above
+remain unchecked until the runner completes against a real frozen setup and
+the recorded pre/post artifacts and metrics validate.
 
 ## 2. Direct task arithmetic
 

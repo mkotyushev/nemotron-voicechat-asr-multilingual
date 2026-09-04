@@ -38,6 +38,7 @@ from typing import Any
 import numpy as np
 
 _ALIGNMENT = "alignment.json"
+_BASELINE = "baseline.json"
 
 # The published repo each config belongs to. The local directory name is not it
 # -- download.sh chooses that -- and a model card gets read by someone who wants
@@ -58,7 +59,10 @@ def write_safetensors(path: Path, tensors: dict[str, np.ndarray], metadata: dict
 
     header: dict[str, Any] = {"__metadata__": {k: str(v) for k, v in metadata.items()}}
     blob = bytearray()
-    for name, array in tensors.items():
+    # Sorting makes a pass-through export byte-reproducible even when its state
+    # dict came from a mapping with a different insertion order.
+    for name in sorted(tensors):
+        array = tensors[name]
         array = np.ascontiguousarray(array, dtype=np.float32)
         start = len(blob)
         blob += array.tobytes()
@@ -92,6 +96,7 @@ def export(
     """Write the directory `convert_asr_to_mmproj.py --asr-dir` can consume alone."""
 
     output.mkdir(parents=True, exist_ok=True)
+    artifact_kind = report.get("artifact_kind", "aligned_checkpoint")
 
     tensors: dict[str, np.ndarray] = dict(encoder)
     tensors["proj.weight"] = proj_weight
@@ -104,7 +109,8 @@ def export(
         tensors,
         {
             "derived_from": str(source),
-            "alignment_map": str(report.get("map", "?")),
+            "artifact_kind": str(artifact_kind),
+            "alignment_map": str(report.get("map")),
             "format": "pt",
         },
     )
@@ -113,27 +119,75 @@ def export(
     # Extra keys are preserved and ignored by every config loader, and this is
     # the only place a reader of the bare directory would look for the story.
     config["derived_from"] = str(source)
-    config["voicechat_alignment"] = {
-        "map": report.get("map"),
-        "projection_dim": int(proj_weight.shape[0]),
-        "calibration": report.get("audio"),
-        "fit_frames": report.get("fit_frames"),
-        "note": (
-            "Encoder weights are the upstream ones, unchanged. proj.* is "
-            "VoiceChat's 1024 -> 4480 projection composed with a map fitted "
-            "between this encoder's output and VoiceChat's. See alignment.json."
-        ),
-    }
+    if artifact_kind == "pt_ml_baseline":
+        config["voicechat_baseline"] = {
+            "comparison": 1,
+            "projection_dim": int(proj_weight.shape[0]),
+            "alignment_map": None,
+            "note": (
+                "Encoder weights are the upstream PT_ML tensors unchanged. "
+                "proj.* and the featurizer are exact copies of the FT_EN "
+                "VoiceChat source; no interface map was fitted or applied."
+            ),
+        }
+    else:
+        config["voicechat_alignment"] = {
+            "map": report.get("map"),
+            "projection_dim": int(proj_weight.shape[0]),
+            "calibration": report.get("audio"),
+            "fit_frames": report.get("fit_frames"),
+            "note": (
+                "Encoder weights are the upstream ones, unchanged. proj.* is "
+                "VoiceChat's 1024 -> 4480 projection composed with a map fitted "
+                "between this encoder's output and VoiceChat's. See alignment.json."
+            ),
+        }
     (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     processor = source / "processor_config.json"
     if processor.exists():
         (output / "processor_config.json").write_text(processor.read_text())
 
-    (output / _ALIGNMENT).write_text(json.dumps(report, indent=2) + "\n")
-    (output / "README.md").write_text(
-        model_card(output.name, UPSTREAM.get(config.get("model_type", "")), report)
+    if artifact_kind == "pt_ml_baseline":
+        (output / _BASELINE).write_text(json.dumps(report, indent=2) + "\n")
+        card = baseline_model_card(
+            output.name, UPSTREAM.get(config.get("model_type", "")), report
+        )
+    else:
+        (output / _ALIGNMENT).write_text(json.dumps(report, indent=2) + "\n")
+        card = model_card(output.name, UPSTREAM.get(config.get("model_type", "")), report)
+    (output / "README.md").write_text(card)
+
+
+def baseline_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:
+    """Describe Comparison 1 without implying that an alignment was fitted."""
+
+    origin = (
+        f"[`{upstream}`](https://huggingface.co/{upstream})" if upstream
+        else "the pinned PT_ML streaming ASR checkpoint"
     )
+    return f"""# {name}
+
+Comparison 1 (`PT_ML` baseline) for the multilingual VoiceChat encoder-transfer
+experiment. The encoder is an unchanged pass-through copy of {origin}. The
+projection and mel-featurizer tensors are exact copies of the pinned
+VoiceChat/`FT_EN` source recorded in `{report.get('shared_setup_sha256', '?')}`.
+
+## What was changed
+
+No alignment map was fitted or applied. The standalone ASR checkpoint does not
+ship VoiceChat's 1024 -> {report.get('projection_dim', 4480)} projection or its
+stored mel filterbank/window, so those tensors were attached unchanged to make
+the checkpoint self-contained for conversion. `baseline.json` records the
+frozen setup, source hashes, equality checks, and experiment command.
+
+## Limits
+
+This artifact is a research baseline, not evidence of a deployable multilingual
+VoiceChat model. It contains no RNN-T decoder/joint or language-prompt projector,
+and retrieval metrics are screening evidence rather than an ASR or VoiceChat
+deployment evaluation.
+"""
 
 
 def model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:

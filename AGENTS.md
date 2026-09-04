@@ -58,8 +58,8 @@ complete without producing and validating the stated artifacts and metrics.
   FLEURS manifest creation and audio-file verification.
 - `asr_align/evaluation.py`: the versioned result contract and common evaluator
   for every comparison, including paired bootstrap intervals against PT_ML.
-- `asr_align/weights.py`: maps ASR safetensors and the VoiceChat GGUF onto one
-  canonical state-dict naming scheme.
+- `asr_align/weights.py`: maps ASR safetensors, the original VoiceChat
+  safetensors, and deployment GGUFs onto one canonical state-dict naming scheme.
 - `asr_align/encoder.py` and `asr_align/features.py`: PyTorch port of the exact
   deployed FastConformer graph and featurizer.
 - `asr_align/interface.py`: interface-map fitting, projection folding, and
@@ -88,13 +88,13 @@ complete without producing and validating the stated artifacts and metrics.
    rely on PyTorch or NumPy broadcasting. Reject missing, extra, NaN, or infinite
    tensors.
 3. Perform arithmetic in F32 through `asr_align.experiments`. Load ASR sources
-   with `mmproj_precision=False` for arithmetic. Quantize only a final exported
-   artifact, then evaluate it again.
-4. `load_asr()` and `load_container()` default to `mmproj_precision=True` for
-   runtime-parity work. That deliberately simulates the converter's F16/Q8_0
-   rounding. Do not accidentally use that default for task-vector construction.
-   The FT_EN GGUF is already quantized at source; dequantizing it to F32 cannot
-   recover an unavailable pre-quantization checkpoint, so record that fact.
+   with `mmproj_precision=False` and load FT_EN from the original NVIDIA
+   safetensors. Quantize only a final exported artifact, then evaluate it again.
+4. Never use a dequantized Q8_0 VoiceChat container as the FT_EN arithmetic or
+   reference source. `load_container()` remains for runtime-parity and legacy
+   analysis only. Use `load_voicechat_safetensors()` for FT_EN; any F16/Q8_0
+   rounding belongs to the final deployment conversion and must be measured as
+   a separate post-quantization stage.
 5. Every candidate uses an exact independent copy of the complete PT_ML runtime
    configuration. Do not inherit attention context or processor configuration
    from PT_EN or FT_EN. The known left contexts differ: PT_ML is 56 frames;
@@ -147,19 +147,17 @@ actual ASR/VoiceChat evaluation required by the final checklist.
 
 ## Environment and reproducible setup
 
-The host's default `python3` may not have NumPy, Torch, or SoundFile. Prefer the
-project environment created by:
+The host's default `python3` may not have NumPy, Torch, or SoundFile. Create the
+locked repository-local project environment with:
 
 ```bash
-cp .env.example .env
-./align_setup.sh
+UV_PROJECT_ENVIRONMENT=.venv-align uv sync --python 3.12
 ```
 
-`align_setup.sh` creates `.venv-align`, installs CUDA Torch and dependencies,
-pins/patches an external runtime reader under `.cache`, and downloads
-LibriSpeech. It performs network access and force-cleans only that cached
-runtime checkout; do not run it casually when a prepared environment already
-exists. FLEURS and model artifacts are not guaranteed to be present.
+`align_setup.sh` is retained for bootstrapping missing data and the external
+runtime reader. It performs network access and force-cleans only that cached
+runtime checkout; do not run it when a prepared reader and datasets already
+exist. FLEURS and model artifacts are not guaranteed to be present.
 
 Materialize a real shared setup before model comparisons:
 
@@ -173,7 +171,9 @@ cp shared_setup.example.json .cache/shared_setup.local.json
 
 The example file is intentionally invalid until all placeholder revisions and
 evidence are replaced. Checkpoint paths alone are not provenance; keep the
-pinned repo revision and SHA-256 artifact hashes in `shared_setup.json`.
+pinned repo revision and SHA-256 artifact hashes in `shared_setup.json`. FT_EN
+must point at the original NVIDIA safetensors checkpoint, never a Q8_0
+container.
 
 ## Verification before committing
 

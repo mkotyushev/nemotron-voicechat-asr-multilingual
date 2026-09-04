@@ -31,6 +31,8 @@ checkpoint. It is not evidence that the model is generally multilingual.
 |---|---|
 | `align_asr.py` | fit, evaluate, and export an interface map |
 | `shared_setup.py` | pin checkpoints, validate arithmetic, and freeze all shared manifests |
+| `pt_ml_baseline.py` | run Comparison 1 and freeze the PT_ML reference artifacts |
+| `asr_align/baseline.py` | PT_ML pass-through, provenance, equality, and precision checks |
 | `asr_align/experiments.py` | checkpoint roles, strict F32 encoder arithmetic, and provenance |
 | `asr_align/manifests.py` | immutable speaker/sentence/take manifests |
 | `asr_align/evaluation.py` | common comparison metrics, diagnostics, and paired intervals |
@@ -39,7 +41,7 @@ checkpoint. It is not evidence that the model is generally multilingual.
 | `asr_align/interface.py` | interface-map fits and held-out scoring |
 | `asr_align/transport.py` | activation-based transport/permutation plans |
 | `asr_align/fuse.py` | unfinished weight-space fusion arm |
-| `asr_align/export.py` | write a standalone aligned checkpoint |
+| `asr_align/export.py` | write a standalone aligned or pass-through checkpoint |
 | `check_encoder_parity.py` | compare the PyTorch port with runtime embeddings |
 | `crosslingual_probe.py` | multilingual retrieval probe |
 | `convert_asr_to_mmproj.py` | inspect or convert an exported checkpoint |
@@ -51,7 +53,11 @@ The experiment needs three model artifacts:
 
 1. `E = PT_EN`: `nvidia/nemotron-speech-streaming-en-0.6b`.
 2. `M = PT_ML`: `nvidia/nemotron-3.5-asr-streaming-0.6b`.
-3. `F = FT_EN`: the VoiceChat source container.
+3. `F = FT_EN`: the original NVIDIA VoiceChat `model.safetensors` checkpoint.
+
+Do not use a Q8_0 container dequantized back to F32 as `FT_EN`; the lost
+precision cannot be recovered. GGUF quantization is only applied to a final
+export immediately before deployment evaluation.
 
 The server conversion additionally needs its tokenizer files.
 
@@ -73,13 +79,13 @@ The default `.env.example` here points `MODEL_DIR` at that sibling repo's
 ## Setup
 
 ```bash
-cp .env.example .env
-./align_setup.sh
+uv init --bare --name nemotron-voicechat-asr-multilingual --python 3.12
+UV_PROJECT_ENVIRONMENT=.venv-align uv sync --python 3.12
 ```
 
-The setup script creates a separate CUDA PyTorch environment, downloads
-LibriSpeech `dev-clean`, and prepares the pinned runtime reader used for parity
-checks. It does not modify the server environment.
+The locked project environment contains CUDA PyTorch and the scientific/audio
+dependencies. `align_setup.sh` remains available to download LibriSpeech and
+prepare a runtime reader when those assets are not already present.
 
 ## Frozen shared experiment setup
 
@@ -113,7 +119,8 @@ reserved `test` splits. FLEURS is evaluation-only. Every audio record is pinned
 by path, byte count, and SHA-256; consumers verify those values before a run.
 All model arithmetic is over exact canonical `encoder.*` tensors in F32, using
 the fixed lambda sweep `0, .25, .5, .75, 1` with `1` as the primary endpoint.
-Only final exported artifacts may be quantized.
+FT_EN is read from the original VoiceChat safetensors; only final exported
+artifacts may be quantized.
 
 Run the fit with:
 
@@ -136,6 +143,34 @@ That contract always includes English VoiceChat-space R²/cosine, the three
 retrieval views, top-1/top-5/MRR/median rank/hit count/N, paired bootstrap
 intervals against `PT_ML`, embedding mean/norm diagnostics, manifest hashes,
 and an explicit pre- or post-quantization stage.
+
+### Comparison 1: PT_ML baseline
+
+Run the unmodified multilingual reference only after `shared_setup.py` has
+materialized a real frozen setup:
+
+```bash
+.venv-align/bin/python pt_ml_baseline.py \
+    --shared-setup .cache/experiments/shared-v1/shared_setup.json \
+    --work .cache/llama-voicechat.cpp \
+    --device cuda \
+    -o .cache/experiments/comparison-1-pt-ml
+```
+
+The runner refuses to replace an existing output. It rehashes the pinned
+checkpoints and manifests, uses the exact `PT_ML` runtime configuration, and
+never fits an alignment map. It exports a self-contained F32 pass-through
+checkpoint, converts it to a real Q8_0 perception GGUF, reloads the GGUF, and
+requires its tensors to exactly match the converter-rounding model before
+running both precision stages through the common evaluator.
+
+The output records the command and hashes in `run.json`, writes pre/post result
+records under `results/`, saves the exact arrays later comparisons must use as
+their paired PT_ML reference under `embeddings/`, and shards the pre-quantized
+subsampling/block outputs for LibriSpeech `map_train` and `validation` under
+`activations/`. The reserved LibriSpeech `test` split is not encoded. Optional
+`--parity-wav` plus `--runtime-log` runs the recorded runtime parity check as
+part of the experiment.
 
 ## Why the encoder cannot simply be swapped
 
