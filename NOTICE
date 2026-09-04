@@ -1,0 +1,18 @@
+This repository contains experimental ASR-alignment code licensed under the
+MIT License in LICENSE.
+
+It operates on NVIDIA NemotronLabs VoiceChat and streaming ASR model materials.
+Those weights are not included and remain subject to NVIDIA's OpenMDW License
+Agreement, version 1.1, and the notices in their upstream repositories:
+
+  https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B
+  https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
+  https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b
+
+The runtime parity checks use sansamour/llama-voicechat.cpp, an MIT-licensed
+fork of llama.cpp:
+
+  https://github.com/sansamour/llama-voicechat.cpp
+
+This is an independent, unfinished research project and is not an NVIDIA
+release.
