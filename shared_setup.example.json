@@ -1,7 +1,6 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "seed": 0,
-  "container_reader_work": ".cache/llama-voicechat.cpp",
   "checkpoints": {
     "E": {
       "name": "PT_EN",
@@ -19,10 +18,10 @@
     },
     "F": {
       "name": "FT_EN",
-      "kind": "voicechat_container",
+      "kind": "voicechat_safetensors",
       "repo_id": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B",
       "revision": "REPLACE_WITH_PINNED_REVISION",
-      "path": "../nemotron-voicechat-realtime-gguf/models/nemotron_voicechat_11b-Q8_0.gguf",
+      "path": ".cache/models/NVIDIA-NemotronLabs-VoiceChat-11B",
       "ancestor": {
         "repo_id": "nvidia/nemotron-speech-streaming-en-0.6b",
         "revision": "REPLACE_WITH_THE_SAME_PT_EN_REVISION",

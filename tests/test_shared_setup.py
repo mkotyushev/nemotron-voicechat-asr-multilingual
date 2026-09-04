@@ -25,6 +25,7 @@ from asr_align.experiments import (
     validate_encoder_triplet,
     verify_declared_ancestor,
 )
+from shared_setup import _artifact_origin
 
 
 def _state(offset: float = 0.0) -> dict[str, torch.Tensor]:
@@ -104,6 +105,24 @@ class ArithmeticTests(unittest.TestCase):
                     "evidence": "https://example.test/release-note",
                 },
             )
+
+    def test_derived_artifact_origin_is_explicit_and_immutable(self) -> None:
+        origin = _artifact_origin("F", {
+            "artifact_origin": {
+                "repo_id": "example/derived-gguf",
+                "revision": "abc1234",
+                "evidence": "https://example.test/derived-gguf/commit/abc1234",
+            }
+        })
+        self.assertEqual(origin["revision"], "abc1234")
+        with self.assertRaisesRegex(ExperimentValidationError, "not immutable"):
+            _artifact_origin("F", {
+                "artifact_origin": {
+                    "repo_id": "example/derived-gguf",
+                    "revision": "main",
+                    "evidence": "https://example.test/derived-gguf",
+                }
+            })
 
 
 class ManifestTests(unittest.TestCase):

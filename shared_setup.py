@@ -26,6 +26,7 @@ from asr_align.experiments import (
     ARITHMETIC_PRECISION,
     LAMBDAS,
     ROLE_DEFINITIONS,
+    SHARED_SETUP_SCHEMA_VERSION,
     CheckpointIdentity,
     ExperimentValidationError,
     arithmetic_summary,
@@ -36,7 +37,7 @@ from asr_align.experiments import (
     stable_json_sha256,
     verify_declared_ancestor,
 )
-from asr_align.weights import load_asr, load_container
+from asr_align.weights import load_asr, load_voicechat_safetensors
 
 logger = logging.getLogger("shared-setup")
 
@@ -53,7 +54,7 @@ def _identity(base: Path, role: str, raw: Mapping[str, Any]) -> CheckpointIdenti
     value = dict(raw)
     value["path"] = str(_path(base, value.get("path", "")))
     identity = CheckpointIdentity.from_dict(role, value)
-    expected_kind = "voicechat_container" if role == "F" else "asr"
+    expected_kind = "voicechat_safetensors" if role == "F" else "asr"
     if identity.kind != expected_kind:
         raise ExperimentValidationError(
             f"{role}/{ROLE_DEFINITIONS[role]} must have kind {expected_kind!r}"
@@ -69,8 +70,49 @@ def _asr_files(identity: CheckpointIdentity) -> list[Path]:
     return required
 
 
+def _voicechat_files(identity: CheckpointIdentity) -> list[Path]:
+    root = identity.path if identity.path.is_dir() else identity.path.parent
+    model = identity.path if identity.path.is_file() else root / "model.safetensors"
+    return [model, root / "config.json"]
+
+
 def _read_full_config(identity: CheckpointIdentity) -> dict[str, Any]:
-    return json.loads((identity.path / "config.json").read_text(encoding="utf-8"))
+    root = identity.path if identity.path.is_dir() else identity.path.parent
+    return json.loads((root / "config.json").read_text(encoding="utf-8"))
+
+
+def _artifact_origin(role: str, raw: Mapping[str, Any]) -> dict[str, str] | None:
+    """Validate optional provenance for a locally mirrored/converted artifact.
+
+    The checkpoint identity names the authoritative source model.  A local
+    file can come from a separate immutable mirror or conversion repository;
+    recording that fact avoids falsely attributing derived bytes to the source
+    repository while retaining the fixed experiment role.
+    """
+
+    value = raw.get("artifact_origin")
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ExperimentValidationError(f"{role} artifact_origin must be an object")
+    result = {
+        key: str(value.get(key, "")).strip()
+        for key in ("repo_id", "revision", "evidence")
+    }
+    if not all(result.values()):
+        raise ExperimentValidationError(
+            f"{role} artifact_origin needs repo_id, revision, and evidence"
+        )
+    revision = result["revision"].lower()
+    if revision in {"main", "master", "latest", "head"} or any(
+        token in revision for token in ("replace", "todo", "unknown")
+    ):
+        raise ExperimentValidationError(
+            f"{role} artifact_origin revision {result['revision']!r} is not immutable"
+        )
+    if any(token in result["evidence"].lower() for token in ("replace", "todo", "unknown")):
+        raise ExperimentValidationError(f"{role} artifact_origin evidence is a placeholder")
+    return result
 
 
 def _write_frozen_setup(path: Path, value: Mapping[str, Any]) -> None:
@@ -89,8 +131,10 @@ def prepare(spec_path: Path, output: Path) -> dict[str, Any]:
     spec_path = spec_path.resolve()
     base = spec_path.parent
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    if spec.get("schema_version") != "1.0":
-        raise ExperimentValidationError("shared setup spec must have schema_version '1.0'")
+    if spec.get("schema_version") != SHARED_SETUP_SCHEMA_VERSION:
+        raise ExperimentValidationError(
+            f"shared setup spec must have schema_version {SHARED_SETUP_SCHEMA_VERSION!r}"
+        )
     raw_checkpoints = spec.get("checkpoints")
     if not isinstance(raw_checkpoints, dict) or set(raw_checkpoints) != set(ROLE_DEFINITIONS):
         raise ExperimentValidationError("checkpoints must define exactly E, M, and F")
@@ -109,13 +153,12 @@ def prepare(spec_path: Path, output: Path) -> dict[str, Any]:
     if precision.get("quantization_stage") != "final_artifact_only":
         raise ExperimentValidationError("quantization_stage must be final_artifact_only")
 
-    work = _path(base, spec.get("container_reader_work", ".cache/llama-voicechat.cpp"))
     logger.info("loading E/PT_EN without deployment rounding: %s", identities["E"].path)
     e = load_asr(identities["E"].path, mmproj_precision=False)
     logger.info("loading M/PT_ML without deployment rounding: %s", identities["M"].path)
     m = load_asr(identities["M"].path, mmproj_precision=False)
-    logger.info("loading F/FT_EN into canonical F32 tensors: %s", identities["F"].path)
-    f = load_container(identities["F"].path, work, mmproj_precision=False)
+    logger.info("loading unquantized F/FT_EN into canonical F32 tensors: %s", identities["F"].path)
+    f = load_voicechat_safetensors(identities["F"].path)
 
     logger.info("validating exact encoder keys, shapes, finiteness, and lambda sweep")
     arithmetic = arithmetic_summary(e, m, f)
@@ -123,9 +166,7 @@ def prepare(spec_path: Path, output: Path) -> dict[str, Any]:
     full_configs = {
         "E": _read_full_config(identities["E"]),
         "M": _read_full_config(identities["M"]),
-        # A GGUF has no HF config file; load_container reconstructs exactly the
-        # graph-shaping values consumed by this experiment's runtime port.
-        "F": dict(f.config),
+        "F": _read_full_config(identities["F"]),
     }
     checkpoint_records = {
         "E": record_checkpoint(
@@ -135,9 +176,13 @@ def prepare(spec_path: Path, output: Path) -> dict[str, Any]:
             identities["M"], config=full_configs["M"], files=_asr_files(identities["M"])
         ),
         "F": record_checkpoint(
-            identities["F"], config=full_configs["F"], files=[identities["F"].path]
+            identities["F"], config=full_configs["F"], files=_voicechat_files(identities["F"])
         ),
     }
+    for role in ROLE_DEFINITIONS:
+        artifact_origin = _artifact_origin(role, raw_checkpoints[role])
+        if artifact_origin is not None:
+            checkpoint_records[role]["artifact_origin"] = artifact_origin
 
     logger.info("freezing LibriSpeech and FLEURS manifests")
     data_spec = spec.get("data", {})
@@ -183,7 +228,7 @@ def prepare(spec_path: Path, output: Path) -> dict[str, Any]:
         candidate_config_hashes[f"{weight:g}"] = stable_json_sha256(inherited)
 
     report = {
-        "schema_version": "1.0",
+        "schema_version": SHARED_SETUP_SCHEMA_VERSION,
         "specification": {
             "path": str(spec_path),
             "sha256": sha256_file(spec_path),
@@ -195,7 +240,9 @@ def prepare(spec_path: Path, output: Path) -> dict[str, Any]:
         "precision": {
             "arithmetic": ARITHMETIC_PRECISION,
             "source_loading": "no simulated deployment rounding",
-            "ft_en_source_note": "container quantization is intrinsic to the source artifact",
+            "ft_en_source_note": (
+                "original VoiceChat safetensors; no deployment quantization in the source"
+            ),
             "quantization_stage": "final_artifact_only",
             "deployment_quantization": precision.get("deployment_quantization", "Q8_0"),
             "required_score_stages": list(evaluation.PRECISION_STAGES),
@@ -255,8 +302,9 @@ def main() -> None:
         report = prepare(args.spec, args.output)
     except ExperimentValidationError as error:
         raise SystemExit(f"shared setup rejected: {error}") from error
-    logger.info("shared setup ready: %s", args.output.resolve() / "shared_setup.json")
-    logger.info("setup sha256: %s", stable_json_sha256(report))
+    output_path = args.output.resolve() / "shared_setup.json"
+    logger.info("shared setup ready: %s", output_path)
+    logger.info("setup file sha256: %s", sha256_file(output_path))
 
 
 if __name__ == "__main__":

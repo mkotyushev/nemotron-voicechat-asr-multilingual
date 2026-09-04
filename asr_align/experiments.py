@@ -39,6 +39,7 @@ LAMBDAS = (0.0, 0.25, 0.5, 0.75, 1.0)
 PRIMARY_LAMBDA = 1.0
 ARITHMETIC_DTYPE = torch.float32
 ARITHMETIC_PRECISION = "float32"
+SHARED_SETUP_SCHEMA_VERSION = "1.1"
 
 
 class ExperimentValidationError(ValueError):
@@ -83,7 +84,7 @@ class CheckpointIdentity:
             raise ExperimentValidationError(
                 f"{role}/{expected} revision {revision!r} is movable; pin a commit or immutable tag"
             )
-        allowed_kinds = {"asr", "voicechat_container"}
+        allowed_kinds = {"asr", "voicechat_container", "voicechat_safetensors"}
         if kind not in allowed_kinds:
             raise ExperimentValidationError(
                 f"{role}/{expected} kind {kind!r} is not one of {sorted(allowed_kinds)}"

@@ -1,9 +1,9 @@
 """One naming for three encoders that are the same architecture.
 
-The perception encoder exists here in two containers with two sets of names:
+The perception encoder exists here under two sets of names:
 
-  * the VoiceChat GGUF, under NeMo names (`encoder.pre_encode.conv.0`,
-    `self_attn.linear_q`, `conv.batch_norm`), quantized;
+  * the original VoiceChat safetensors (and derived GGUFs), under NeMo names
+    (`encoder.pre_encode.conv.0`, `self_attn.linear_q`, `conv.batch_norm`);
   * `nvidia/nemotron-*-asr-streaming-*` safetensors, under the HF port's names
     (`encoder.subsampling.conv_in`, `self_attn.q_proj`, `conv.norm`), F32.
 
@@ -21,6 +21,7 @@ problem this package exists to solve, so the loaders keep it visible:
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -166,11 +167,24 @@ def q8_0(tensor: torch.Tensor) -> torch.Tensor:
     holds it to that.
     """
 
-    flat = tensor.reshape(-1, 32).double()
+    # Keep the quantizer arithmetic in F32.  ggml's reference implementation
+    # computes both ``d`` and ``1/d`` as floats, and its Python writer mirrors
+    # C ``roundf`` (half away from zero).  Torch's default ``round`` is
+    # ties-to-even and doing the scale calculation in F64 can move a value
+    # across a rounding boundary, so either shortcut can differ by one Q8 code.
+    flat = tensor.float().reshape(-1, 32)
     amax = flat.abs().amax(dim=1, keepdim=True)
-    scale = (amax / 127.0).to(torch.float16).to(torch.float64)
-    codes = torch.where(amax > 0, flat / (amax / 127.0).clamp_min(1e-30), flat * 0).round()
-    return (codes.clamp(-128, 127) * scale).reshape(tensor.shape).float()
+    unrounded_scale = amax / 127.0
+    inverse_scale = torch.where(unrounded_scale != 0, 1.0 / unrounded_scale, 0.0)
+    scaled = flat * inverse_scale
+    # Spell roundf the same way as gguf-py's ``np_roundf``.  ``floor(x+.5)``
+    # is mathematically equivalent but not bit-equivalent in F32: for a value
+    # immediately below .5, adding .5 can itself round up to exactly 1.0.
+    magnitude = scaled.abs()
+    integral = torch.floor(magnitude)
+    codes = scaled.sign() * (integral + torch.floor(2.0 * (magnitude - integral)))
+    stored_scale = unrounded_scale.to(torch.float16).to(torch.float32)
+    return (codes.clamp(-128, 127) * stored_scale).reshape(tensor.shape)
 
 
 def _as_deployed(name: str, tensor: torch.Tensor, mmproj_precision: bool) -> torch.Tensor:
@@ -247,53 +261,49 @@ def load_asr(asr_dir: Path, *, mmproj_precision: bool = True) -> EncoderWeights:
     return EncoderWeights(out, config, asr_dir.name)
 
 
-def load_container(container: Path, work: Path, *, mmproj_precision: bool = True) -> EncoderWeights:
-    """`stt_model.perception` out of the VoiceChat GGUF, under HF names.
-
-    Dequantized on the way, because everything downstream compares activations
-    and there is no point keeping Q8_0 blocks around. The 8-bit error stays in:
-    it is what the deployment runs with, and an alignment fitted against a
-    hypothetical F32 VoiceChat encoder would be fitted against an encoder that
-    is not the one serving.
-    """
-
-    src = _gguf_source(container, work)
-
-    def take(nemo: str) -> torch.Tensor:
-        return _torch(src.f32(CONTAINER_PREFIX + nemo))
+def _load_voicechat_perception(take, contains, *, name: str) -> EncoderWeights:
+    """Map one NeMo-named VoiceChat tensor source to canonical HF names."""
 
     n_layer = 0
-    while f"{CONTAINER_PREFIX}encoder.layers.{n_layer}.norm_out.weight" in src.tensors:
+    while contains(f"{CONTAINER_PREFIX}encoder.layers.{n_layer}.norm_out.weight"):
         n_layer += 1
     if n_layer == 0:
-        raise SystemExit(f"{container}: no {CONTAINER_PREFIX}encoder.layers.* tensors")
+        raise SystemExit(f"{name}: no {CONTAINER_PREFIX}encoder.layers.* tensors")
 
-    class _Out(dict):
-        def __setitem__(self, key, value):
-            super().__setitem__(key, _as_deployed(key, value, mmproj_precision))
-
-    out: dict[str, torch.Tensor] = _Out()
+    out: dict[str, torch.Tensor] = {}
     for index, module in SUBSAMPLING_CONVS:
-        out[module + ".weight"] = take(f"encoder.pre_encode.conv.{index}.weight")
-        out[module + ".bias"] = take(f"encoder.pre_encode.conv.{index}.bias")
-    out["encoder.subsampling.linear.weight"] = take("encoder.pre_encode.out.weight")
-    out["encoder.subsampling.linear.bias"] = take("encoder.pre_encode.out.bias")
+        out[module + ".weight"] = take(
+            f"{CONTAINER_PREFIX}encoder.pre_encode.conv.{index}.weight"
+        )
+        out[module + ".bias"] = take(
+            f"{CONTAINER_PREFIX}encoder.pre_encode.conv.{index}.bias"
+        )
+    out["encoder.subsampling.linear.weight"] = take(
+        f"{CONTAINER_PREFIX}encoder.pre_encode.out.weight"
+    )
+    out["encoder.subsampling.linear.bias"] = take(
+        f"{CONTAINER_PREFIX}encoder.pre_encode.out.bias"
+    )
 
     for il in range(n_layer):
         p = f"encoder.layers.{il}."
         for nemo, hf in ATTENTION:
-            out[p + hf] = take(p + nemo)
-        for name in SHARED:
-            out[p + name] = take(p + name)
+            out[p + hf] = take(CONTAINER_PREFIX + p + nemo)
+        for suffix in SHARED:
+            out[p + suffix] = take(CONTAINER_PREFIX + p + suffix)
         for nemo, hf in CONV_NORM:
-            out[p + hf] = take(p + nemo)
+            out[p + hf] = take(CONTAINER_PREFIX + p + nemo)
 
-    # Container-only, and the reason this file has two loaders rather than one.
-    out["proj.weight"] = take("proj.weight")
-    out["proj.bias"] = take("proj.bias")
+    # VoiceChat-only, and the reason this file has two naming adapters.
+    out["proj.weight"] = take(f"{CONTAINER_PREFIX}proj.weight")
+    out["proj.bias"] = take(f"{CONTAINER_PREFIX}proj.bias")
     # {1, 128, 257} in numpy order; the graph reads it flat as [mel][fft_bin].
-    out["featurizer.fb"] = take("preprocessor.featurizer.fb").reshape(N_MEL, -1)
-    out["featurizer.window"] = take("preprocessor.featurizer.window")
+    out["featurizer.fb"] = take(
+        f"{CONTAINER_PREFIX}preprocessor.featurizer.fb"
+    ).reshape(N_MEL, -1)
+    out["featurizer.window"] = take(
+        f"{CONTAINER_PREFIX}preprocessor.featurizer.window"
+    )
 
     # VoiceChat's own att_context_size is [70, 0]. The graph takes it from the
     # mmproj rather than from a config, so state it the way the two published
@@ -308,7 +318,134 @@ def load_container(container: Path, work: Path, *, mmproj_precision: bool = True
         "conv_kernel_size": int(out["encoder.layers.0.conv.depthwise_conv.weight"].shape[-1]),
         "sliding_window": 71,
     }
-    return EncoderWeights(out, config, "container")
+    return EncoderWeights(out, config, name)
+
+
+def load_voicechat_safetensors(checkpoint: Path) -> EncoderWeights:
+    """Load the original, unquantized VoiceChat perception checkpoint.
+
+    ``checkpoint`` may be the NVIDIA checkpoint directory or its
+    ``model.safetensors`` file.  No deployment rounding is simulated here:
+    these tensors are the F32 arithmetic/evaluation source.  Quantization is a
+    later export step and its result is loaded separately with
+    :func:`load_mmproj`.
+    """
+
+    path = checkpoint / "model.safetensors" if checkpoint.is_dir() else checkpoint
+    st = _safetensors(path)
+    return _load_voicechat_perception(
+        lambda tensor_name: _torch(st.f32(tensor_name)),
+        lambda tensor_name: tensor_name in st,
+        name=path.parent.name,
+    )
+
+
+def load_container(container: Path, work: Path, *, mmproj_precision: bool = True) -> EncoderWeights:
+    """Load a derived VoiceChat GGUF for runtime-parity or legacy analysis.
+
+    A quantized container is never a valid task-arithmetic source.  This loader
+    remains for checking deployed artifacts and reproducing historical results;
+    :func:`load_voicechat_safetensors` is the full-precision FT_EN source.
+    """
+
+    src = _gguf_source(container, work)
+
+    def take(tensor_name: str) -> torch.Tensor:
+        return _torch(src.f32(tensor_name))
+
+    weights = _load_voicechat_perception(
+        take,
+        lambda tensor_name: tensor_name in src.tensors,
+        name=container.name,
+    )
+    if mmproj_precision:
+        for tensor_name, value in list(weights.items()):
+            weights[tensor_name] = _as_deployed(tensor_name, value, True)
+    return weights
+
+
+def load_mmproj(
+    mmproj: Path,
+    work: Path,
+    *,
+    config: dict,
+) -> EncoderWeights:
+    """Reload a converted VoiceChat perception GGUF under canonical names.
+
+    Unlike :func:`load_asr` with ``mmproj_precision=True``, this reads the
+    actual F16/Q8_0 blocks written by :mod:`convert_asr_to_mmproj`.  Comparison
+    1 uses both paths and requires exact equality, turning the in-memory
+    deployment-rounding model into a checked property of the real artifact.
+    ``config`` must be the complete PT_ML encoder configuration inherited by
+    the candidate; graph settings are never borrowed from FT_EN or inferred
+    from tensor shapes.
+    """
+
+    src = _gguf_source(mmproj, work)
+
+    def take(name: str) -> torch.Tensor:
+        return _torch(src.f32(name))
+
+    out: dict[str, torch.Tensor] = {}
+    for index, module in SUBSAMPLING_CONVS:
+        out[module + ".weight"] = take(f"a.conv1d.{index}.weight")
+        out[module + ".bias"] = take(f"a.conv1d.{index}.bias").reshape(-1)
+    out["encoder.subsampling.linear.weight"] = take("a.pre_encode.out.weight")
+    out["encoder.subsampling.linear.bias"] = take("a.pre_encode.out.bias")
+
+    attention = (
+        ("attn_q.weight", "self_attn.q_proj.weight"),
+        ("attn_k.weight", "self_attn.k_proj.weight"),
+        ("attn_v.weight", "self_attn.v_proj.weight"),
+        ("attn_out.weight", "self_attn.o_proj.weight"),
+        ("linear_pos.weight", "self_attn.relative_k_proj.weight"),
+    )
+    norms = (
+        ("ln1", "norm_self_att"),
+        ("ln2", "norm_out"),
+        ("ffn_norm", "norm_feed_forward1"),
+        ("ffn_norm_1", "norm_feed_forward2"),
+        ("norm_conv", "norm_conv"),
+    )
+    feed_forwards = (
+        ("ffn_up.weight", "feed_forward1.linear1.weight"),
+        ("ffn_down.weight", "feed_forward1.linear2.weight"),
+        ("ffn_up_1.weight", "feed_forward2.linear1.weight"),
+        ("ffn_down_1.weight", "feed_forward2.linear2.weight"),
+    )
+    for index in range(int(config["num_hidden_layers"])):
+        source = f"a.blk.{index}."
+        destination = f"encoder.layers.{index}."
+        for mmproj_name, canonical_name in attention:
+            out[destination + canonical_name] = take(source + mmproj_name)
+        out[destination + "self_attn.bias_u"] = take(source + "pos_bias_u")
+        out[destination + "self_attn.bias_v"] = take(source + "pos_bias_v")
+        for mmproj_name, canonical_name in norms:
+            out[destination + canonical_name + ".weight"] = take(
+                source + mmproj_name + ".weight"
+            )
+            out[destination + canonical_name + ".bias"] = take(
+                source + mmproj_name + ".bias"
+            )
+        for mmproj_name, canonical_name in feed_forwards:
+            out[destination + canonical_name] = take(source + mmproj_name)
+        out[destination + "conv.pointwise_conv1.weight"] = take(
+            source + "conv_pw1.weight"
+        ).unsqueeze(-1)
+        out[destination + "conv.pointwise_conv2.weight"] = take(
+            source + "conv_pw2.weight"
+        ).unsqueeze(-1)
+        out[destination + "conv.depthwise_conv.weight"] = take(
+            source + "conv_dw.weight"
+        ).unsqueeze(1)
+        out[destination + "conv.norm.weight"] = take(source + "conv_norm.weight")
+        out[destination + "conv.norm.bias"] = take(source + "conv_norm.bias")
+
+    out["proj.weight"] = take("mm.a.proj.weight")
+    out["proj.bias"] = take("mm.a.proj.bias")
+    out["featurizer.fb"] = take("a.mel_filters").reshape(N_MEL, -1)
+    out["featurizer.window"] = take("a.window")
+    return EncoderWeights(out, copy.deepcopy(config), mmproj.name)
 
 
 def load_prompt_projector(asr_dir: Path, prompt_id: int) -> dict[str, torch.Tensor] | None:
