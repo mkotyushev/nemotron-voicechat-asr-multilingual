@@ -12,28 +12,15 @@ VENV=${ALIGN_VENV:-$HERE/.venv-align}
 DATA=${ALIGN_DATA:-$HERE/.cache/data}
 WORK=${CONVERT_WORK:-$HERE/.cache/llama-voicechat.cpp}
 UV=${UV:-uv}
-TORCH_INDEX=${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}
 
 command -v "$UV" >/dev/null 2>&1 || { echo "no uv at $UV — set UV=" >&2; exit 1; }
 
 # ----------------------------------------------------------------- the venv
-if [ ! -x "$VENV/bin/python" ]; then
-    echo "== creating $VENV =="
-    # 3.12 to match the deployment's .venv, so anything learned about one
-    # environment transfers to the other.
-    "$UV" venv --python 3.12 "$VENV"
-fi
-
-if ! "$VENV/bin/python" -c "import torch" 2>/dev/null; then
-    echo "== installing torch from $TORCH_INDEX =="
-    VIRTUAL_ENV="$VENV" "$UV" pip install --index-url "$TORCH_INDEX" torch
-fi
-
-echo "== installing the rest =="
-# numpy and scipy for the transport solvers, POT for the exact barycentric plan
-# (--column-assignment barycentric only; the integral one is scipy's), and
-# soundfile to read LibriSpeech's flac.
-VIRTUAL_ENV="$VENV" "$UV" pip install numpy scipy pot soundfile
+# Python and package versions live in pyproject.toml/uv.lock.  Keep the
+# historical setup command useful without creating a second, independently
+# resolved environment.
+echo "== syncing $VENV from uv.lock =="
+UV_PROJECT_ENVIRONMENT="$VENV" "$UV" sync --python 3.12
 
 "$VENV/bin/python" - <<'PY'
 import torch

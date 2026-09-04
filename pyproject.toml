@@ -1,0 +1,25 @@
+[project]
+name = "nemotron-voicechat-asr-multilingual"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "pot",
+    "pyyaml",
+    "requests",
+    "scipy",
+    "soundfile",
+    "torch",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
