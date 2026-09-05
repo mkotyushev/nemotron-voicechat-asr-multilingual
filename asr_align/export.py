@@ -39,6 +39,7 @@ import numpy as np
 
 _ALIGNMENT = "alignment.json"
 _BASELINE = "baseline.json"
+_DIRECT = "direct_task_arithmetic.json"
 
 # The published repo each config belongs to. The local directory name is not it
 # -- download.sh chooses that -- and a model card gets read by someone who wants
@@ -130,6 +131,19 @@ def export(
                 "VoiceChat source; no interface map was fitted or applied."
             ),
         }
+    elif artifact_kind == "direct_task_arithmetic":
+        config["voicechat_direct_task_arithmetic"] = {
+            "comparison": 2,
+            "lambda": float(report["lambda"]),
+            "formula": "M + lambda * (F - E)",
+            "projection_dim": int(proj_weight.shape[0]),
+            "alignment_map": None,
+            "note": (
+                "Only canonical encoder.* tensors use direct F32 task arithmetic. "
+                "proj.* and the featurizer are exact copies of the FT_EN VoiceChat "
+                "source; the complete runtime configuration comes from PT_ML."
+            ),
+        }
     else:
         config["voicechat_alignment"] = {
             "map": report.get("map"),
@@ -153,10 +167,46 @@ def export(
         card = baseline_model_card(
             output.name, UPSTREAM.get(config.get("model_type", "")), report
         )
+    elif artifact_kind == "direct_task_arithmetic":
+        (output / _DIRECT).write_text(json.dumps(report, indent=2) + "\n")
+        card = direct_model_card(
+            output.name, UPSTREAM.get(config.get("model_type", "")), report
+        )
     else:
         (output / _ALIGNMENT).write_text(json.dumps(report, indent=2) + "\n")
         card = model_card(output.name, UPSTREAM.get(config.get("model_type", "")), report)
     (output / "README.md").write_text(card)
+
+
+def direct_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:
+    """Describe a Comparison 2 artifact without claiming interface alignment."""
+
+    origin = (
+        f"[`{upstream}`](https://huggingface.co/{upstream})" if upstream
+        else "the pinned PT_ML streaming ASR checkpoint"
+    )
+    return f"""# {name}
+
+Comparison 2 (direct task arithmetic) for the multilingual VoiceChat
+encoder-transfer experiment. Starting from {origin}, canonical encoder tensors
+were constructed in F32 as `M + {report.get('lambda', '?')} * (F - E)`.
+
+## Interface and runtime configuration
+
+No activation or interface map was fitted. The projection and mel-featurizer
+tensors are exact copies of the pinned VoiceChat/`FT_EN` source, while the
+complete runtime configuration—including the 56-frame left context—comes from
+`PT_ML`. `direct_task_arithmetic.json` records the frozen setup, source hashes,
+task-vector checks, candidate equality checks, and experiment command.
+
+## Limits
+
+This artifact is a research candidate, not evidence of a deployable
+multilingual VoiceChat model. It contains no RNN-T decoder/joint or language
+prompt projector, and retrieval metrics are screening evidence rather than an
+ASR or VoiceChat deployment evaluation. No final lambda was selected in this
+comparison.
+"""
 
 
 def baseline_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:

@@ -11,6 +11,12 @@ dependencies = [
     "soundfile",
     "torch",
     "tqdm",
+    "websockets>=15,<16",
+]
+
+[project.optional-dependencies]
+data-preparation = [
+    "pyarrow>=20",
 ]
 
 [tool.uv]

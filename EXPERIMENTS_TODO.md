@@ -27,6 +27,64 @@ Implemented by `shared_setup.py` and `asr_align/{experiments,manifests,evaluatio
 Each experiment must materialize its own immutable `shared_setup.json` before
 running; the command rejects unpinned/mismatched checkpoints or changed data.
 
+### Speech-to-action tool calling
+
+Every metric above is measured inside the encoder or the VoiceChat projection.
+None of them shows whether the language model still understands the request and
+emits the right call, and retrieval cannot show it: a foreign-language embedding
+that ranks well is not evidence that the frozen LLM can read it. Every candidate
+therefore also runs through the deployed server, scored at the boundary before
+TTS.
+
+The measured path is:
+
+```text
+English/Russian speech
+  -> candidate perception encoder + VoiceChat projection
+  -> frozen VoiceChat LLM
+     |-- assistant text tokens  -> decoded transcript (scored; TTS excluded)
+     `-- function tokens        -> parsed tool call -> deterministic stub result
+                                                    -> post-tool assistant text
+```
+
+- [x] Score the pre-TTS boundary: decoded assistant text and the parsed
+  structured call. Generated speech is recorded only as a discarded byte count.
+- [x] Pair each case: the same request in English and Russian, with identical
+  English tool schemas, and an expected call that is language-invariant.
+- [x] Score every language against the canonical expected call, not against the
+  other language's output, so a shared failure cannot look like agreement.
+- [x] Make exact single-call accuracy the primary endpoint, and record tool
+  attempt, well-formedness, tool name, argument types, and argument values
+  separately so a failure can be located.
+- [x] Record assistant text as required-fact matches rather than exact wording,
+  and record English-output compliance separately from tool correctness.
+- [x] Report the paired Russian-minus-English difference, Russian success
+  conditional on English success, and the identical-call rate.
+- [x] Serve each candidate from a pinned runtime commit and one pinned runtime
+  environment, and verify through the server which encoder is loaded.
+- [x] Measure the response budget from the end of the audio, so a longer clip is
+  not given less decoding time than a shorter one.
+- [x] Refuse to place rows scored under different manifests, prompts, budgets,
+  runtimes, or precision stages in one table.
+- [x] Include a control row served by the original `FT_EN` encoder, which bounds
+  what the frozen LLM can do on this data and proves the harness elicits calls.
+- [ ] Replace the development pilot with a frozen benchmark before any
+  deployment claim: it is six single-call numeric cases, its Russian audio is
+  single-speaker synthesis, and its results may be inspected before choices are
+  made.
+
+Implemented by `voice_assistant_evaluation.py` and `asr_align/voice_assistant.py`.
+Retrieval remains screening evidence; this is the endpoint the alignment exists
+to move.
+
+The first three rows are recorded in the ignored pilot output named in each
+`run.json`, with the combined table in its `analysis/`. The `FT_EN` control calls
+the correct tool on four of six English cases and answers all six Russian clips
+in English without ever attempting a call. Comparisons 1 and 2 produce no
+assistant turn at all in either language, so their per-language and paired scores
+are zero for a different reason than the control's Russian zeros, which the
+`Responded` column separates.
+
 ## 1. `PT_ML` baseline
 
 - [x] Load the unmodified `PT_ML` encoder.
@@ -39,6 +97,7 @@ running; the command rejects unpinned/mismatched checkpoints or changed data.
 - [x] Run the complete shared evaluation.
 - [x] Save pooled embeddings and per-layer activations for reuse.
 - [x] Record this result as the reference against which comparisons 2–5 are measured.
+- [x] Run the paired speech-to-action tool-calling evaluation on the deployment artifact.
 
 Done when the baseline is reproducible and its artifact, manifest, metrics, and hashes are recorded.
 
@@ -55,22 +114,28 @@ Construct:
 C_\lambda=M+\lambda\Delta_F.
 \]
 
-- [ ] Compute the encoder-only task vector `FT_EN − PT_EN`.
-- [ ] Record task-vector norms by block, module type, and tensor.
-- [ ] Verify the reconstruction invariant:
+- [x] Compute the encoder-only task vector `FT_EN − PT_EN`.
+- [x] Record task-vector norms by block, module type, and tensor.
+- [x] Verify the reconstruction invariant:
   \[
   E+(F-E)\approx F.
   \]
-- [ ] Verify that \(\lambda=0\) exactly reproduces the `PT_ML` baseline.
-- [ ] Construct candidates for every predefined \(\lambda\).
-- [ ] Keep the original VoiceChat projection unchanged.
-- [ ] Run forward checks for finite outputs and abnormal activation/norm growth.
-- [ ] Run the complete shared evaluation for every \(\lambda\).
-- [ ] Quantize and reevaluate the primary \(\lambda=1\) artifact.
-- [ ] Plot or tabulate the English-transfer versus multilingual-retention Pareto curve.
-- [ ] Do not select a final \(\lambda\) yet; preserve all development results.
+- [x] Verify that \(\lambda=0\) exactly reproduces the `PT_ML` baseline.
+- [x] Construct candidates for every predefined \(\lambda\).
+- [x] Keep the original VoiceChat projection unchanged.
+- [x] Run forward checks for finite outputs and abnormal activation/norm growth.
+- [x] Run the complete shared evaluation for every \(\lambda\).
+- [x] Quantize and reevaluate the primary \(\lambda=1\) artifact.
+- [x] Plot or tabulate the English-transfer versus multilingual-retention Pareto curve.
+- [x] Do not select a final \(\lambda\) yet; preserve all development results.
+- [x] Run the paired speech-to-action tool-calling evaluation on the primary
+  \(\lambda=1\) deployment artifact.
 
 Done when direct arithmetic has a validated \(\lambda\)-sweep and a deployment-precision result at \(\lambda=1\).
+
+Implemented by `direct_task_arithmetic.py` and `asr_align/direct.py`. The
+validated run is recorded under the ignored experiment output named in its
+`run.json`; every result is paired against the exact frozen Comparison 1 arrays.
 
 ## 3. Final activation-map projection only
 
@@ -95,6 +160,10 @@ Keep the `PT_ML` encoder unchanged and learn only the final activation correspon
 - [ ] Run the complete shared evaluation.
 - [ ] Compare directly with comparison 1 to isolate the effect of interface alignment.
 - [ ] Quantize and reevaluate the mapped projection.
+- [ ] Run the paired speech-to-action tool-calling evaluation on the deployment
+  artifact. Its exported directory must carry the folded `proj.*` and featurizer
+  tensors, or the deployment converter silently falls back to the container's
+  own projection and invalidates the result.
 
 Done when the benefit and cross-lingual cost of final-layer alignment are measured independently of task-vector fusion.
 
@@ -137,6 +206,8 @@ Learn activation maps for every relevant internal representation and use them to
 - [ ] Report this transported-update agreement at every layer.
 - [ ] Run the complete shared evaluation for every \(\lambda\).
 - [ ] Quantize and reevaluate the primary \(\lambda=1\) artifact.
+- [ ] Run the paired speech-to-action tool-calling evaluation on the primary
+  \(\lambda=1\) deployment artifact, exported with its own projection.
 
 Done when both the endpoint metrics and the layerwise transported-update approximation have been measured. Do not treat the method as successful solely because the base activation maps have high R².
 
@@ -166,6 +237,8 @@ Reuse comparison 4’s activation maps, but apply structurally incompatible para
   - comparison 2 to measure the value of dense activation transport;
   - comparison 4 to measure whether direct structured deltas outperform architecture-projected structured deltas;
   - comparison 3 to verify that improvement is not explained only by the final activation map.
+- [ ] Run the paired speech-to-action tool-calling evaluation on the primary
+  \(\lambda=1\) deployment artifact, exported with its own projection.
 
 Done when the hybrid/full-transport difference is isolated and all tensor-routing decisions are reproducible.
 
@@ -179,6 +252,8 @@ Done when the hybrid/full-transport difference is isolated and all tensor-routin
   - VoiceChat-space cross-lingual alignment
   - layerwise transport fidelity
   - quantization sensitivity
+  - paired English/Russian speech-to-action tool calling, against the `FT_EN`
+    control row
 - [ ] Select a candidate only from development results.
 - [ ] Evaluate the selected candidate once on the reserved final split.
 - [ ] Treat retrieval as screening evidence and run actual ASR/VoiceChat evaluation before making a deployment claim.

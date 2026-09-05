@@ -20,10 +20,21 @@ server default.
   English embedding agreement.
 - The map reduced some of the multilingual information measured by retrieval.
 - The orthogonal map performed worse than ridge regression.
-- Weight-space fusion has not been measured end to end.
+- Direct encoder-only task arithmetic has been measured end to end. Small
+  coefficients trade modest English-space gains against retention, while the
+  larger coefficients sharply reduce multilingual retrieval.
+- Measured through the deployed server on spoken tool-calling requests, neither
+  the unmodified multilingual encoder nor direct task arithmetic at the primary
+  coefficient produces any assistant turn at all, in either language. The
+  original encoder answers on the same clips and calls the right tool on four of
+  six English cases, so the harness and prompt are not the obstacle. That same
+  control answers all six Russian clips in English while never attempting a
+  tool call, having plainly misheard them.
 
 The useful result so far is a reproducible experiment and an ordinary exported
-checkpoint. It is not evidence that the model is generally multilingual.
+checkpoint. It is not evidence that the model is generally multilingual, and the
+end-to-end measurement is currently a negative result: the encoder-space metrics
+that improve are not yet enough for the language model to respond.
 
 ## Layout
 
@@ -33,9 +44,13 @@ checkpoint. It is not evidence that the model is generally multilingual.
 | `shared_setup.py` | pin checkpoints, validate arithmetic, and freeze all shared manifests |
 | `pt_ml_baseline.py` | run Comparison 1 and freeze the PT_ML reference artifacts |
 | `asr_align/baseline.py` | PT_ML pass-through, provenance, equality, and precision checks |
+| `direct_task_arithmetic.py` | run the fixed Comparison 2 task-arithmetic sweep |
+| `asr_align/direct.py` | task-vector reports, baseline validation, growth checks, and Pareto tables |
 | `asr_align/experiments.py` | checkpoint roles, strict F32 encoder arithmetic, and provenance |
 | `asr_align/manifests.py` | immutable speaker/sentence/take manifests |
 | `asr_align/evaluation.py` | common comparison metrics, diagnostics, and paired intervals |
+| `voice_assistant_evaluation.py` | freeze the paired speech pilot and score a served candidate |
+| `asr_align/voice_assistant.py` | pre-TTS tool-call scoring, candidate contract, and the cross-candidate table |
 | `asr_align/encoder.py` | PyTorch port of the runtime FastConformer graph |
 | `asr_align/features.py` | matching audio featurizer |
 | `asr_align/interface.py` | interface-map fits and held-out scoring |
@@ -171,6 +186,105 @@ subsampling/block outputs for LibriSpeech `map_train` and `validation` under
 `activations/`. The reserved LibriSpeech `test` split is not encoded. Optional
 `--parity-wav` plus `--runtime-log` runs the recorded runtime parity check as
 part of the experiment.
+
+### Comparison 2: direct task arithmetic
+
+Run the complete fixed sweep only after Comparison 1 has produced its frozen
+paired-reference arrays:
+
+```bash
+.venv-align/bin/python direct_task_arithmetic.py \
+    --shared-setup .cache/experiments/shared-v1/shared_setup.json \
+    --baseline .cache/experiments/comparison-1-pt-ml \
+    --work .cache/llama-voicechat.cpp \
+    --device cuda \
+    -o .cache/experiments/comparison-2-direct
+```
+
+The runner computes `FT_EN - PT_EN` only over canonical `encoder.*` tensors in
+F32, records norms by block/module/tensor, verifies reconstruction, exports and
+evaluates all five predefined lambdas, and checks lambda zero exactly against
+Comparison 1. The original VoiceChat projection and complete PT_ML runtime
+configuration remain unchanged. Only the primary lambda-one artifact is
+converted to Q8_0 and reevaluated. The development Pareto table is recorded
+without selecting a final lambda.
+
+### Paired English/Russian speech-to-action tool calling
+
+Retrieval and VoiceChat-space agreement are measured inside the encoder. They
+cannot say whether the frozen language model still understands the request and
+emits the right tool call, which is what the alignment exists to achieve. Every
+candidate that reaches a deployment artifact therefore also runs through the
+pinned deployment server and is scored at the boundary before TTS: the decoded
+assistant text and the parsed structured call. Generated speech is discarded.
+
+Freeze the dataset once. English uses the official AU-Harness BFCL-v3
+recordings; Russian uses pinned Silero synthesis of the RFCB translations of the
+same cases, so the expected call is identical in both languages:
+
+```bash
+.venv-align/bin/python voice_assistant_evaluation.py prepare \
+    --rfcb .cache/datasets/RFCB \
+    --silero .cache/tools/silero-models \
+    --bfcl-audio .cache/datasets/BFCL_v3_audio \
+    --bfcl-audio-revision <immutable-dataset-commit> \
+    --russian-model <silero-ru-model.pt> \
+    --output .cache/experiments/voice-assistant-pilot-v2/dataset
+```
+
+Serve one encoder at a time from the pinned runtime, then score it. A run pins
+the served artifact, the runtime commit, and the runtime environment file, and
+verifies through the server which encoder is actually loaded:
+
+```bash
+ASR_MODEL=direct-lambda-1 docker compose \
+    --env-file .cache/experiments/voice-assistant-pilot-v2/runtime.env \
+    -f /tmp/nemotron-voicechat-main-<revision>/docker-compose.yml up -d voicechat
+
+.venv-align/bin/python voice_assistant_evaluation.py run \
+    --manifest .cache/experiments/voice-assistant-pilot-v2/dataset/manifest.json \
+    --expected-asr-model direct-lambda-1 \
+    --candidate-id direct-lambda-1 --comparison 2 \
+    --precision post_quantization \
+    --artifact <served-mmproj.gguf> \
+    --shared-setup .cache/experiments/comparison-2-direct-v1/shared_setup.json \
+    --runtime-repository ~/model-deployments/nemotron-voicechat \
+    --runtime-revision <immutable-runtime-commit> \
+    --runtime-env .cache/experiments/voice-assistant-pilot-v2/runtime.env \
+    --output .cache/experiments/voice-assistant-pilot-v2/direct-lambda-1-post-q8
+```
+
+The primary endpoint is exact single-call accuracy per language. Tool attempt,
+well-formedness, tool name, argument types, and argument values are recorded
+separately, as are required-fact matches in the assistant text and English-output
+compliance. Each language is scored against the canonical expected call rather
+than against the other language, so an identical failure in both cannot look
+like cross-lingual success.
+
+The scored text is what the model hands to TTS, so it spells numbers out. Fact
+matching therefore reads spoken English numerals -- "one hundred and twenty"
+satisfies a required `120` -- while a bare numeric fact still has to appear as
+its own token, so `10` is not evidence for `1`. Rounding is not forgiven: a
+response saying `8.85` does not satisfy a required `8.854`. A call naming the
+right tool with the wrong separator is scored wrong, because it is not
+dispatchable, but it is flagged as `tool_name_separator_variant` so a near miss
+is distinguishable from calling a different tool.
+
+`compare` collects the scored rows into one table and refuses to combine rows
+produced under different manifests, prompts, response budgets, runtimes, or
+precision stages. Every table also carries an `FT_EN` control row served by the
+original VoiceChat encoder, which bounds what the frozen language model can do
+on this data.
+
+The response budget is measured from the end of the audio rather than from the
+start of the session. Measuring it from the session start would give a long clip
+less decoding time than a short one, and the Russian clips are systematically
+shorter than the English ones -- a bias directly on the cross-language quantity
+being scored.
+
+This is a development pilot: six single-call numeric cases with single-speaker
+synthesized Russian audio. It detects gross differences, and it may not be used
+to select a candidate for a deployment claim.
 
 ## Why the encoder cannot simply be swapped
 

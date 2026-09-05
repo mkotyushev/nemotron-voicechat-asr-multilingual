@@ -87,6 +87,7 @@ def retrieval_metrics(
     reference: np.ndarray,
     *,
     pt_ml_probe: np.ndarray | None = None,
+    pt_ml_reference: np.ndarray | None = None,
     centered: bool = True,
     confidence: float = 0.95,
     bootstrap_samples: int = 2000,
@@ -99,11 +100,17 @@ def retrieval_metrics(
     ranks = retrieval_ranks(probe, reference, centered=centered)
     # Comparison 1 is its own reference and therefore has exact zero paired
     # differences.  Later comparisons pass the frozen PT_ML embeddings.
-    baseline_ranks = (
-        ranks.copy()
-        if pt_ml_probe is None
-        else retrieval_ranks(pt_ml_probe, reference, centered=centered)
-    )
+    if pt_ml_probe is None:
+        if pt_ml_reference is not None:
+            raise ExperimentValidationError(
+                "pt_ml_reference requires the matching frozen pt_ml_probe"
+            )
+        baseline_ranks = ranks.copy()
+    else:
+        baseline_reference = reference if pt_ml_reference is None else pt_ml_reference
+        baseline_ranks = retrieval_ranks(
+            pt_ml_probe, baseline_reference, centered=centered
+        )
     if baseline_ranks.shape != ranks.shape:
         raise ExperimentValidationError("candidate and PT_ML retrieval query counts differ")
 
@@ -268,7 +275,12 @@ def evaluate_candidate(
     english_target: np.ndarray,
     pt_ml_english_prediction: np.ndarray,
     retrieval_inputs: Mapping[
-        str, Mapping[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
+        str,
+        Mapping[
+            str,
+            tuple[np.ndarray, np.ndarray, np.ndarray]
+            | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        ],
     ],
     diagnostic_embeddings: Mapping[str, np.ndarray],
     manifest_hashes: Mapping[str, str],
@@ -276,8 +288,12 @@ def evaluate_candidate(
 ) -> dict[str, Any]:
     """Run every shared metric and return the versioned comparison record.
 
-    Each retrieval tuple is ``(candidate_probe, reference, pt_ml_probe)`` and
-    groups are typically ``overall`` for English or locale names for FLEURS.
+    Each retrieval tuple is either ``(candidate_probe, candidate_reference,
+    pt_ml_probe)`` when both candidates share a fixed reference, or the same
+    tuple plus ``pt_ml_reference`` when the PT_ML baseline has its own frozen
+    reference embeddings.  The latter is required for intrinsic
+    candidate-to-candidate retrieval.  Groups are typically ``overall`` for
+    English or locale names for FLEURS.
     """
 
     if comparison not in range(1, 6):
@@ -304,18 +320,26 @@ def evaluate_candidate(
         groups = retrieval_inputs[task]
         if not groups:
             raise ExperimentValidationError(f"{task} has no groups")
-        evaluations[task] = {
-            "groups": {
-                group: retrieval_metrics(
-                    candidate_probe,
-                    reference,
-                    pt_ml_probe=pt_ml_probe,
-                    centered=True,
-                    seed=seed,
+        evaluated_groups: dict[str, Any] = {}
+        for group, inputs in groups.items():
+            if len(inputs) == 3:
+                candidate_probe, reference, pt_ml_probe = inputs
+                pt_ml_reference = None
+            elif len(inputs) == 4:
+                candidate_probe, reference, pt_ml_probe, pt_ml_reference = inputs
+            else:
+                raise ExperimentValidationError(
+                    f"{task}/{group} retrieval tuple must have three or four arrays"
                 )
-                for group, (candidate_probe, reference, pt_ml_probe) in groups.items()
-            }
-        }
+            evaluated_groups[group] = retrieval_metrics(
+                candidate_probe,
+                reference,
+                pt_ml_probe=pt_ml_probe,
+                pt_ml_reference=pt_ml_reference,
+                centered=True,
+                seed=seed,
+            )
+        evaluations[task] = {"groups": evaluated_groups}
     result = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "comparison": comparison,

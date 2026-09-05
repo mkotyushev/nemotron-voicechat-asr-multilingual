@@ -58,6 +58,13 @@ complete without producing and validating the stated artifacts and metrics.
   FLEURS manifest creation and audio-file verification.
 - `asr_align/evaluation.py`: the versioned result contract and common evaluator
   for every comparison, including paired bootstrap intervals against PT_ML.
+- `voice_assistant_evaluation.py` and `asr_align/voice_assistant.py`: the paired
+  English/Russian speech-to-action evaluation. Every candidate is served by the
+  pinned deployment runtime and scored before TTS on its structured tool call
+  and assistant text.
+- `direct_task_arithmetic.py` and `asr_align/direct.py`: the Comparison 2 runner,
+  task-vector norm/reconstruction reports, frozen-baseline validation,
+  activation-growth checks, and development Pareto table.
 - `asr_align/weights.py`: maps ASR safetensors, the original VoiceChat
   safetensors, and deployment GGUFs onto one canonical state-dict naming scheme.
 - `asr_align/encoder.py` and `asr_align/features.py`: PyTorch port of the exact
@@ -78,6 +85,8 @@ complete without producing and validating the stated artifacts and metrics.
   utilities also reused by `asr_align/weights.py`.
 - `tests/test_shared_setup.py`: unit coverage for shared invariants, manifests,
   and the evaluation contract.
+- `tests/test_voice_assistant.py`: unit coverage for the speech-to-action
+  manifest, candidate contract, scoring, and cross-candidate table.
 
 ## Non-negotiable experiment invariants
 
@@ -105,6 +114,15 @@ complete without producing and validating the stated artifacts and metrics.
 7. Use the fixed lambda sweep from `asr_align.experiments`; do not add an ad hoc
    coefficient or select a final lambda before the specified development
    comparisons are complete.
+8. Every candidate that reaches a deployment artifact also runs the paired
+   speech-to-action evaluation. Retrieval never substitutes for it: a candidate
+   whose foreign embeddings rank well may still leave the frozen language model
+   unable to answer or call a tool.
+9. Speech-to-action rows are comparable only under one frozen manifest, system
+   prompt, response budget, runtime commit, runtime environment, and precision
+   stage. `build_comparison()` enforces this; do not assemble a table by hand.
+   The shared runtime environment file must not name `ASR_MODEL`, which differs
+   per row and is verified through the server's discovery endpoint.
 
 ## Data and model-selection rules
 
@@ -142,8 +160,19 @@ Comparison 1 is the PT_ML reference; its paired deltas are zero. Later
 comparisons must pass the exact frozen PT_ML predictions/embeddings as the
 paired baseline, not rerun or reshuffle a separate baseline.
 
+Every candidate exported to a deployment artifact additionally emits a
+`asr_align.voice_assistant` result: exact single-call accuracy per language as
+the primary endpoint, tool attempt/well-formedness/name/argument-type/value
+breakdowns, required-fact scoring of the assistant text, English-output
+compliance, and the paired Russian-minus-English difference. Each table also
+carries the `FT_EN` control row, which bounds what the frozen language model can
+do on this data and proves the harness elicits calls at all.
+
 Retrieval is screening evidence. Do not make a deployment claim without the
-actual ASR/VoiceChat evaluation required by the final checklist.
+actual ASR/VoiceChat evaluation required by the final checklist. The current
+speech-to-action pilot is a development split: six single-call numeric cases
+with synthesized Russian audio, and its results may be inspected before
+prompt/model choices are made.
 
 ## Environment and reproducible setup
 
@@ -177,6 +206,19 @@ container.
 
 ## Verification before committing
 
+Serving a candidate for the speech-to-action evaluation uses the pinned
+deployment runtime, one encoder per run:
+
+```bash
+ASR_MODEL=<candidate-name> docker compose \
+  --env-file .cache/experiments/<pilot>/runtime.env \
+  -f /tmp/nemotron-voicechat-main-<revision>/docker-compose.yml up -d voicechat
+```
+
+Wait for `backend_status: ready`, and let the runner check `asr_model` through
+the server rather than assuming the restart took effect. Only one session is
+allowed at a time, so runs are sequential.
+
 For ordinary Python changes, run:
 
 ```bash
@@ -197,9 +239,18 @@ embedding/activation outputs required by `EXPERIMENTS_TODO.md`.
 
 ## First steps for the next comparison
 
-For comparison 1, start from the frozen shared setup rather than adding another
-configuration system. Load the unmodified PT_ML encoder, attach the original
-FT_EN VoiceChat projection, run a deterministic finite-output check, export and
-reload a pass-through copy, verify pre-quantization encoder equality, quantify
-deployment quantization, run the entire common evaluator, and save pooled plus
-per-layer activations for reuse. Do not refit an interface map in this baseline.
+For comparison 3, reuse the exact frozen shared setup and Comparison 1 PT_ML
+activation/reference caches. Collect matching PT_EN final-layer activations on
+LibriSpeech `map_train` and `validation`, fit both identity-regularized ridge
+directions using `map_train` only, and select regularization on `validation`.
+Evaluate the already-selected maps on FLEURS without refitting before folding
+the reverse map into the unchanged FT_EN VoiceChat projection. Keep every
+`encoder.*` tensor byte-identical to PT_ML and run both precision stages through
+the common evaluator.
+
+Comparison 3 is the first arm with a learned projection, so its exported
+directory must contain the folded `proj.*` and featurizer tensors. Without them
+the deployment converter falls back to the container's own projection and the
+served artifact silently stops being the candidate. After exporting, serve the
+Q8 artifact and add its row to the speech-to-action table alongside the existing
+`FT_EN` control and the comparison 1 and 2 rows.

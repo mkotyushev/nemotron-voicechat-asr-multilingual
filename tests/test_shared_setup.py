@@ -208,6 +208,31 @@ class EvaluationTests(unittest.TestCase):
             self.assertIn(name, result)
             self.assertIn(name, result["confidence_intervals"]["difference_vs_pt_ml"])
 
+    def test_intrinsic_retrieval_uses_frozen_pt_ml_reference_too(self) -> None:
+        candidate_probe = np.eye(6, dtype=np.float64)
+        candidate_reference = candidate_probe.copy()
+        pt_ml_probe = np.roll(candidate_probe, 1, axis=0)
+        pt_ml_reference = pt_ml_probe.copy()
+        result = evaluation.retrieval_metrics(
+            candidate_probe,
+            candidate_reference,
+            pt_ml_probe=pt_ml_probe,
+            pt_ml_reference=pt_ml_reference,
+            bootstrap_samples=50,
+        )
+        self.assertEqual(result["top1"], 1.0)
+        self.assertEqual(
+            result["confidence_intervals"]["difference_vs_pt_ml"]["top1"],
+            {"low": 0.0, "high": 0.0},
+        )
+        with self.assertRaisesRegex(ExperimentValidationError, "requires"):
+            evaluation.retrieval_metrics(
+                candidate_probe,
+                candidate_reference,
+                pt_ml_reference=pt_ml_reference,
+                bootstrap_samples=10,
+            )
+
     def test_complete_candidate_result_uses_one_contract(self) -> None:
         retrieval = {
             task: {"overall": (self.probe, self.reference, self.baseline)}
