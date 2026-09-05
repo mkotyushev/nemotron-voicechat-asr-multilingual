@@ -141,31 +141,62 @@ validated run is recorded under the ignored experiment output named in its
 
 Keep the `PT_ML` encoder unchanged and learn only the final activation correspondence.
 
-- [ ] Collect paired final-layer activations from `PT_EN` and `PT_ML` on LibriSpeech map-training data.
-- [ ] Center activations using training-set statistics.
-- [ ] Fit bidirectional ridge maps:
+- [x] Collect paired final-layer activations from `PT_EN` and `PT_ML` on LibriSpeech map-training data.
+- [x] Center activations using training-set statistics.
+- [x] Fit bidirectional ridge maps:
   \[
   h_EA_L\approx h_M,\qquad h_MB_L\approx h_E.
   \]
-- [ ] Regularize the maps toward identity.
-- [ ] Select regularization using held-out LibriSpeech speakers.
-- [ ] Record held-out R², cosine, condition number, singular values, distance from identity, and cycle consistency.
-- [ ] Test whether both maps generalize to foreign FLEURS activations without refitting.
-- [ ] Fold the reverse map into the VoiceChat projection:
+- [x] Regularize the maps toward identity.
+- [x] Select regularization using held-out LibriSpeech speakers.
+- [x] Record held-out R², cosine, condition number, singular values, distance from identity, and cycle consistency.
+- [x] Test whether both maps generalize to foreign FLEURS activations without refitting.
+- [x] Fold the reverse map into the VoiceChat projection:
   \[
   W_{\text{proj},M}=W_{\text{proj},F}B_L^\top.
   \]
-- [ ] Compose any final affine offset into the projection bias.
-- [ ] Confirm that encoder tensors remain byte-identical to `PT_ML`.
-- [ ] Run the complete shared evaluation.
-- [ ] Compare directly with comparison 1 to isolate the effect of interface alignment.
-- [ ] Quantize and reevaluate the mapped projection.
+- [x] Compose any final affine offset into the projection bias.
+- [x] Confirm that encoder tensors remain byte-identical to `PT_ML`.
+- [x] Run the complete shared evaluation.
+- [x] Compare directly with comparison 1 to isolate the effect of interface alignment.
+- [x] Quantize and reevaluate the mapped projection.
 - [ ] Run the paired speech-to-action tool-calling evaluation on the deployment
   artifact. Its exported directory must carry the folded `proj.*` and featurizer
   tensors, or the deployment converter silently falls back to the container's
   own projection and invalidates the result.
 
 Done when the benefit and cross-lingual cost of final-layer alignment are measured independently of task-vector fusion.
+
+Implemented by `final_map_projection.py` and `asr_align/final_map.py`. The
+validated run is recorded under the ignored experiment output named in its
+`run.json`; `PT_ML`'s side of the paired activations is the frozen Comparison 1
+cache, which reproduced bit-for-bit when one shard per split was re-encoded, and
+every result is paired against the exact frozen Comparison 1 arrays.
+
+Both maps are identity-regularized ridge fits over 57,912 `map_train` frames,
+with the penalty chosen on 21,660 held-out `validation` frames by target-space
+R² rather than by the VoiceChat-space R² the shared evaluator reports, because
+the frozen validation split is also the evaluation split. Selected
+alpha = 0.001 forward and 0.1 reverse; held-out R² is +0.44 in both directions
+against -25.6 and -1.1 for the untouched interface.
+
+What the arm buys, pre- and post-quantization alike, is the English interface:
+VoiceChat-space R² against `FT_EN` moves from -0.701 to -0.024 (paired 95% CI
+[+0.6705, +0.6827]) and cosine from 0.301 to 0.541 ([+0.2385, +0.2413]).
+Intrinsic multilingual retrieval is unchanged to the digit, which is not luck:
+it is measured before the projection and the encoder is byte-identical to
+`PT_ML` (SHA-256 over all 636 canonical tensors matches the source, the export,
+and the Comparison 1 artifact). Historical centered FLEURS retrieval moves by
+less than its paired intervals. So interface alignment alone gets most of the
+English transfer that Comparison 2's task arithmetic failed to get at any
+lambda, at exactly zero cost to what the encoder knows.
+
+The FLEURS generalization test is the honest limit. Both maps hold on English
+FLEURS takes (forward R² +0.36, reverse +0.29) but fall on foreign speech, where
+the reverse map goes negative (-0.31 de, -0.53 fr, -0.67 ru) -- worse than
+predicting the mean, though still well above the untouched interface's -1.8 to
+-2.3. The map is fitted on English because the target only exists for English,
+and it shows.
 
 ## 4. Dense activation-transported task vector
 

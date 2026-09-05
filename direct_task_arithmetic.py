@@ -320,6 +320,7 @@ def _evaluate_stage(
     reference_bundle: Mapping[str, Any],
     manifest_hashes: Mapping[str, str],
     seed: int,
+    comparison: int = direct.COMPARISON,
 ) -> dict[str, Any]:
     candidate_libri = candidate_bundle["librispeech"]
     reference_libri = reference_bundle["librispeech"]
@@ -363,7 +364,7 @@ def _evaluate_stage(
             "english_query_voicechat"
         ]
     return evaluation.evaluate_candidate(
-        comparison=direct.COMPARISON,
+        comparison=comparison,
         candidate_id=candidate_name,
         weight=weight,
         precision=stage,
@@ -385,6 +386,7 @@ def _write_candidate_embeddings(
     weight: float,
     stage: str,
     manifest_hashes: Mapping[str, str],
+    comparison: int = direct.COMPARISON,
 ) -> None:
     arrays = {
         f"librispeech.validation.{name}": value
@@ -396,7 +398,7 @@ def _write_candidate_embeddings(
         path,
         arrays,
         {
-            "comparison": str(direct.COMPARISON),
+            "comparison": str(comparison),
             "candidate_id": candidate_name,
             "lambda": str(weight),
             "precision": stage,

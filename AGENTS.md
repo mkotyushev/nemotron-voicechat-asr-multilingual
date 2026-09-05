@@ -65,6 +65,13 @@ complete without producing and validating the stated artifacts and metrics.
 - `direct_task_arithmetic.py` and `asr_align/direct.py`: the Comparison 2 runner,
   task-vector norm/reconstruction reports, frozen-baseline validation,
   activation-growth checks, and development Pareto table.
+- `final_map_projection.py` and `asr_align/final_map.py`: the Comparison 3
+  runner, identity-regularized bidirectional final-activation ridge maps,
+  held-out regularization selection, map conditioning/cycle-consistency
+  reports, the FLEURS generalization test, projection folding and its
+  verification, the byte-identity check on `encoder.*`, and the paired table
+  against Comparison 1. The evaluation passes are imported from the
+  Comparison 2 runner so both arms produce rows with the same code.
 - `asr_align/weights.py`: maps ASR safetensors, the original VoiceChat
   safetensors, and deployment GGUFs onto one canonical state-dict naming scheme.
 - `asr_align/encoder.py` and `asr_align/features.py`: PyTorch port of the exact
@@ -87,6 +94,9 @@ complete without producing and validating the stated artifacts and metrics.
   and the evaluation contract.
 - `tests/test_voice_assistant.py`: unit coverage for the speech-to-action
   manifest, candidate contract, scoring, and cross-candidate table.
+- `tests/test_final_map.py`: unit coverage for the final activation maps, the
+  projection fold, the frozen activation-cache reader, and the Comparison 3
+  delta table.
 
 ## Non-negotiable experiment invariants
 

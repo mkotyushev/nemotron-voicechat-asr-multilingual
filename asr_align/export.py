@@ -40,6 +40,7 @@ import numpy as np
 _ALIGNMENT = "alignment.json"
 _BASELINE = "baseline.json"
 _DIRECT = "direct_task_arithmetic.json"
+_FINAL_MAP = "final_activation_map.json"
 
 # The published repo each config belongs to. The local directory name is not it
 # -- download.sh chooses that -- and a model card gets read by someone who wants
@@ -144,6 +145,20 @@ def export(
                 "source; the complete runtime configuration comes from PT_ML."
             ),
         }
+    elif artifact_kind == "final_activation_map":
+        config["voicechat_final_activation_map"] = {
+            "comparison": 3,
+            "map": report.get("map"),
+            "alpha": report.get("alpha"),
+            "formula": "W_proj,M = W_proj,F B_L^T; b_proj,M = W_proj,F b_L + b_proj,F",
+            "projection_dim": int(proj_weight.shape[0]),
+            "note": (
+                "Encoder tensors are byte-identical to PT_ML. Only proj.* carries "
+                "the fitted reverse final-activation map, folded into the FT_EN "
+                "VoiceChat projection; the featurizer and the complete runtime "
+                "configuration are unchanged. See final_activation_map.json."
+            ),
+        }
     else:
         config["voicechat_alignment"] = {
             "map": report.get("map"),
@@ -172,10 +187,56 @@ def export(
         card = direct_model_card(
             output.name, UPSTREAM.get(config.get("model_type", "")), report
         )
+    elif artifact_kind == "final_activation_map":
+        (output / _FINAL_MAP).write_text(json.dumps(report, indent=2) + "\n")
+        card = final_map_model_card(
+            output.name, UPSTREAM.get(config.get("model_type", "")), report
+        )
     else:
         (output / _ALIGNMENT).write_text(json.dumps(report, indent=2) + "\n")
         card = model_card(output.name, UPSTREAM.get(config.get("model_type", "")), report)
     (output / "README.md").write_text(card)
+
+
+def final_map_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:
+    """Describe a Comparison 3 artifact: an interface change and nothing else."""
+
+    origin = (
+        f"[`{upstream}`](https://huggingface.co/{upstream})" if upstream
+        else "the pinned PT_ML streaming ASR checkpoint"
+    )
+    held_out = report.get("held_out_r2")
+    held_out_text = f"{held_out:+.4f}" if isinstance(held_out, (int, float)) else "?"
+    return f"""# {name}
+
+Comparison 3 (final activation-map projection only) for the multilingual
+VoiceChat encoder-transfer experiment. The encoder is {origin}, byte-identical:
+`encoder.*` was copied from the published checkpoint and nothing was added to
+it, subtracted from it, or fused into it.
+
+## What was changed
+
+Only `proj.*`. The reverse final-activation map `B_L` was fitted on paired
+`PT_EN`/`PT_ML` final-layer activations over LibriSpeech map-training speakers,
+regularized toward the identity with alpha={report.get('alpha', '?')} selected on
+held-out LibriSpeech speakers (held-out target-space R2 {held_out_text}), and
+folded into the untouched FT_EN projection as `W_proj,F B_L^T`, with the map's
+affine offset composed into the projection bias. The deployed graph is
+unchanged: same tensors, same shapes, same operations.
+
+`final_activation_map.json` records the frozen setup, source hashes, the
+selection sweep, map conditioning and cycle consistency, the FLEURS
+generalization test, and the experiment command.
+
+## Limits
+
+This artifact is a research candidate, not evidence of a deployable
+multilingual VoiceChat model. The map could only be fitted against English
+speech, so whether it carries to other languages is a property of the map and
+is measured, not assumed. It contains no RNN-T decoder/joint or language prompt
+projector, and retrieval metrics are screening evidence rather than an ASR or
+VoiceChat deployment evaluation.
+"""
 
 
 def direct_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:
