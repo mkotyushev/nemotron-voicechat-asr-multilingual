@@ -40,9 +40,11 @@ docstring of `asr_align/fuse.py` (`VC + lambda * (ML - EN)`). The reusable
 transport/rebase code in that module is still relevant, but new comparison code
 must follow `EXPERIMENTS_TODO.md` and `asr_align/experiments.py`.
 
-The Shared setup implementation is complete. Comparisons 1--5 and the final
-comparison remain experimental work; do not mark their result-oriented boxes
-complete without producing and validating the stated artifacts and metrics.
+Shared setup and Comparisons 1--3 have validated artifacts and metrics.
+Comparison 3's completion evidence is indexed in `COMPARISON_3_RESULTS.md`.
+Comparisons 4--5 and the final comparison remain experimental work; do not mark
+their result-oriented boxes complete without producing and validating the
+stated artifacts and metrics. Completion is not a claim of deployment quality.
 
 ## Source map
 
@@ -249,18 +251,18 @@ embedding/activation outputs required by `EXPERIMENTS_TODO.md`.
 
 ## First steps for the next comparison
 
-For comparison 3, reuse the exact frozen shared setup and Comparison 1 PT_ML
-activation/reference caches. Collect matching PT_EN final-layer activations on
-LibriSpeech `map_train` and `validation`, fit both identity-regularized ridge
-directions using `map_train` only, and select regularization on `validation`.
-Evaluate the already-selected maps on FLEURS without refitting before folding
-the reverse map into the unchanged FT_EN VoiceChat projection. Keep every
-`encoder.*` tensor byte-identical to PT_ML and run both precision stages through
-the common evaluator.
+Comparison 4 starts from the same frozen setup and Comparison 1 references.
+Reuse Comparison 3's selected final reverse map in the projection and verify
+the lambda=0 candidate against Comparison 3. Follow the dense-transport
+checklist for collecting internal representations, fitting maps on `map_train`,
+selecting regularization on `validation`, and measuring structured-update
+residuals plus held-out layerwise transported-update agreement. FLEURS remains
+evaluation-only and must not select maps, regularization, lambda, or routing.
 
-Comparison 3 is the first arm with a learned projection, so its exported
-directory must contain the folded `proj.*` and featurizer tensors. Without them
+Every arm with a learned projection must export a directory containing its
+folded `proj.*` and featurizer tensors. Without them
 the deployment converter falls back to the container's own projection and the
 served artifact silently stops being the candidate. After exporting, serve the
 Q8 artifact and add its row to the speech-to-action table alongside the existing
-`FT_EN` control and the comparison 1 and 2 rows.
+`FT_EN` control and comparison 1--3 rows. Create a new table output directory;
+the existing frozen tables must remain unchanged.

@@ -22,8 +22,9 @@ rather than toward zero::
 
     min_W  ||X W - Y||^2 + p ||W - I||^2     p = alpha * mean(diag(Cxx))
 
-so ``alpha -> inf`` degenerates to the untouched interface of Comparison 1 and
-the fit can only move away from it as far as the calibration data pays for.
+so ``alpha -> inf`` sends the linear part toward identity. The unpenalized
+centering offset remains ``mean_Y - mean_X``; this limit is a mean-shift map,
+not the untouched affine interface used by Comparison 1.
 And regularization is selected on held-out LibriSpeech speakers by the map's own
 target-space R2, not by the VoiceChat-space R2 the shared evaluator reports:
 the frozen validation split is also the evaluation split, so selecting on the
@@ -56,9 +57,9 @@ CANDIDATE_ID = "final-map-projection"
 CANDIDATE_LAMBDA = 0.0
 
 # Identity-regularization strengths, relative to the mean source variance so the
-# same value means the same thing whatever the activations' scale.  The high end
-# is deliberately strong enough to be indistinguishable from the untouched
-# interface, so the sweep brackets Comparison 1 rather than starting past it.
+# same value means the same thing whatever the activations' scale. This spans
+# weak through strong regularization of the linear part; the separate identity
+# diagnostic supplies the untouched Comparison 1 interface, including zero bias.
 ALPHAS = (1e-4, 1e-3, 1e-2, 1e-1, 3e-1, 1.0, 3.0, 10.0)
 
 FORWARD = "forward"
@@ -355,10 +356,9 @@ def select_alpha(
 ) -> tuple[AffineMap, list[dict[str, Any]]]:
     """Fit every ``alpha`` and keep the one with the best held-out target R2.
 
-    The whole sweep is returned rather than discarded: a fit that needs the
-    weakest penalty to look good is one that is memorizing the calibration
-    speakers, which is precisely the failure that would leave the other
-    languages worse off than the untouched interface.
+    The whole sweep is returned so sensitivity to regularization can be
+    inspected. Selecting a weak penalty alone does not establish overfitting
+    or predict how the map will behave on other languages.
     """
 
     if not alphas:

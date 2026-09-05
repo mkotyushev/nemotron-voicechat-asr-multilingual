@@ -23,6 +23,11 @@ server default.
 - Direct encoder-only task arithmetic has been measured end to end. Small
   coefficients trade modest English-space gains against retention, while the
   larger coefficients sharply reduce multilingual retrieval.
+- [Comparison 3](COMPARISON_3_RESULTS.md) changes only the final projection.
+  English VoiceChat-space R² improves from -0.701 to -0.024 while intrinsic
+  multilingual retrieval stays exactly unchanged. In the deployed tool-calling
+  pilot it recovers one of six English calls; all six Russian clips and the
+  other five English clips produce no assistant response.
 - Measured through the deployed server on spoken tool-calling requests, neither
   the unmodified multilingual encoder nor direct task arithmetic at the primary
   coefficient produces any assistant turn at all, in either language. The
@@ -33,8 +38,8 @@ server default.
 
 The useful result so far is a reproducible experiment and an ordinary exported
 checkpoint. It is not evidence that the model is generally multilingual, and the
-end-to-end measurement is currently a negative result: the encoder-space metrics
-that improve are not yet enough for the language model to respond.
+end-to-end measurement has not established reliable tool calling: the large
+embedding-space improvement restores only one response in the current pilot.
 
 ## Layout
 
@@ -46,6 +51,9 @@ that improve are not yet enough for the language model to respond.
 | `asr_align/baseline.py` | PT_ML pass-through, provenance, equality, and precision checks |
 | `direct_task_arithmetic.py` | run the fixed Comparison 2 task-arithmetic sweep |
 | `asr_align/direct.py` | task-vector reports, baseline validation, growth checks, and Pareto tables |
+| `final_map_projection.py` | run Comparison 3 with a byte-identical PT_ML encoder and a learned projection |
+| `asr_align/final_map.py` | identity-regularized maps, folding, cache validation, and comparison tables |
+| `COMPARISON_3_RESULTS.md` | Comparison 3 measurements, limitations, and artifact/evidence index |
 | `asr_align/experiments.py` | checkpoint roles, strict F32 encoder arithmetic, and provenance |
 | `asr_align/manifests.py` | immutable speaker/sentence/take manifests |
 | `asr_align/evaluation.py` | common comparison metrics, diagnostics, and paired intervals |

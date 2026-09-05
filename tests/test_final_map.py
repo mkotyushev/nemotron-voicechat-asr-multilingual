@@ -44,11 +44,14 @@ class IdentityRidgeTests(unittest.TestCase):
         self.assertGreater(scored["r2"], 0.999)
         self.assertEqual(scored["n_frames"], x.shape[0])
 
-    def test_strong_penalty_degenerates_to_the_untouched_interface(self) -> None:
+    def test_strong_penalty_keeps_the_training_mean_shift(self) -> None:
         x, y, _, _ = _linear_pair()
         fitted = final_map.identity_ridge_map(_paired_moments(x, y), 1e6, "A_L")
         distance = final_map.identity_distance(fitted)
         self.assertLess(distance["relative_frobenius"], 1e-3)
+        expected_bias = y.double().mean(dim=0) - x.double().mean(dim=0)
+        torch.testing.assert_close(fitted.bias, expected_bias, rtol=1e-4, atol=1e-6)
+        self.assertGreater(float(torch.linalg.vector_norm(fitted.bias)), 0.01)
         self.assertEqual(fitted.detail["regularized_toward"], "identity")
         self.assertEqual(fitted.detail["centering"], "training-set means")
 

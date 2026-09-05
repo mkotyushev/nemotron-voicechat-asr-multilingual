@@ -77,13 +77,15 @@ Implemented by `voice_assistant_evaluation.py` and `asr_align/voice_assistant.py
 Retrieval remains screening evidence; this is the endpoint the alignment exists
 to move.
 
-The first three rows are recorded in the ignored pilot output named in each
-`run.json`, with the combined table in its `analysis/`. The `FT_EN` control calls
+The four rows through Comparison 3 are recorded in the ignored pilot output
+named in each `run.json`, with the combined table in
+`voice-assistant-pilot-v2/analysis-through-comparison-3/`. The `FT_EN` control calls
 the correct tool on four of six English cases and answers all six Russian clips
 in English without ever attempting a call. Comparisons 1 and 2 produce no
 assistant turn at all in either language, so their per-language and paired scores
 are zero for a different reason than the control's Russian zeros, which the
-`Responded` column separates.
+`Responded` column separates. Comparison 3 recovers one exact English call and
+its correct English answer; the other eleven clips produce no assistant turn.
 
 ## 1. `PT_ML` baseline
 
@@ -160,7 +162,7 @@ Keep the `PT_ML` encoder unchanged and learn only the final activation correspon
 - [x] Run the complete shared evaluation.
 - [x] Compare directly with comparison 1 to isolate the effect of interface alignment.
 - [x] Quantize and reevaluate the mapped projection.
-- [ ] Run the paired speech-to-action tool-calling evaluation on the deployment
+- [x] Run the paired speech-to-action tool-calling evaluation on the deployment
   artifact. Its exported directory must carry the folded `proj.*` and featurizer
   tensors, or the deployment converter silently falls back to the container's
   own projection and invalidates the result.
@@ -186,17 +188,37 @@ VoiceChat-space R² against `FT_EN` moves from -0.701 to -0.024 (paired 95% CI
 Intrinsic multilingual retrieval is unchanged to the digit, which is not luck:
 it is measured before the projection and the encoder is byte-identical to
 `PT_ML` (SHA-256 over all 636 canonical tensors matches the source, the export,
-and the Comparison 1 artifact). Historical centered FLEURS retrieval moves by
-less than its paired intervals. So interface alignment alone gets most of the
-English transfer that Comparison 2's task arithmetic failed to get at any
-lambda, at exactly zero cost to what the encoder knows.
+and the Comparison 1 artifact). Historical centered FLEURS top-1 and MRR
+differences have paired intervals containing zero. Post-quantization French
+top-5 improves by 0.0677, CI [0.0075, 0.1278]; the other historical top-5
+intervals include zero. Interface alignment therefore improves this English
+embedding metric more than any Comparison 2 coefficient while preserving the
+measured intrinsic retrieval. It does not establish downstream understanding.
 
 The FLEURS generalization test is the honest limit. Both maps hold on English
 FLEURS takes (forward R² +0.36, reverse +0.29) but fall on foreign speech, where
 the reverse map goes negative (-0.31 de, -0.53 fr, -0.67 ru) -- worse than
 predicting the mean, though still well above the untouched interface's -1.8 to
--2.3. The map is fitted on English because the target only exists for English,
-and it shows.
+-2.3. The map was fitted on English speech only. Foreign scores compare PT_EN
+and PT_ML activations on the same recording; they do not measure foreign
+transcription accuracy.
+
+The deployed Q8 candidate makes 1/6 exact English calls and 0/6 Russian calls
+on the frozen development pilot. Its single response calls `math.factorial`
+with `number=5` and correctly answers 120 in English; all other clips exhaust
+the response budget without a turn, with no transport errors. The paired
+Russian-minus-English difference is -0.1667, 95% CI [-0.5, 0.0]. The FT_EN
+control remains at 4/6 English calls. Large embedding gains thus restore only
+one pilot response and do not support a deployment claim.
+
+[The Comparison 3 report](COMPARISON_3_RESULTS.md) indexes the frozen artifacts,
+commands, hashes, metrics, and completion evidence. Both precision-stage
+results and their paired intervals reproduced exactly from saved embeddings.
+Runtime parity passed on 85 frames with a maximum sampled discrepancy of
+0.0527 embedding standard deviations, within the checker's documented 0.10
+tolerance for fitted projections. All 60 unit tests passed. The earlier
+fitting run remains immutable; completion evidence is saved separately in
+`.cache/experiments/comparison-3-final-map-v1-completion/`.
 
 ## 4. Dense activation-transported task vector
 
