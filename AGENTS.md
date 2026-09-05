@@ -5,6 +5,11 @@ changing code. `EXPERIMENTS_TODO.md` is the current experiment specification;
 complete and check off one comparison at a time. A checked implementation item
 does not imply that a model experiment has been run.
 
+`LITERATURE.md` surveys the published methods for this problem and maps them onto
+the comparison slots. It is a planning document only: it never supersedes
+`EXPERIMENTS_TODO.md`, and naming a method there does not authorise changing a
+fixed sweep or an invariant without a decision recorded in this file.
+
 ## What this repository is
 
 This is the research and checkpoint-export repository for replacing the
