@@ -222,8 +222,13 @@ with far less machinery:
 
 Why this is a better use of the same effort:
 
-- It needs the activations comparison 1 already shards under `activations/`,
-  plus Gram matrices, and nothing else.
+- Plain RegMean needs only the activations comparison 1 already shards under
+  `activations/`, plus Gram matrices. **RegMean++ does not**: those shards are
+  the candidates' own forward passes, whereas ++ requires activations from the
+  partially merged model, recomputed at each depth. Budget `L` sequential passes
+  over the Gram set. The paper is explicit that "RegMean++ incurs additional
+  forward passes in the merged model to collect the inner-product matrices, yet
+  the merging time equals that of RegMean".
 - It never constructs an unsupported dense operation, so the LayerNorm,
   depthwise-convolution, GLU and attention-structure special cases that
   comparisons 4 and 5 exist to arbitrate simply do not arise; non-linear tensors
@@ -412,21 +417,32 @@ repository already has.
    explicit extension of the fixed lambda sweep and invariant 7.
 3. **Layer swapping / partial merge (comparison 2c).** Grid over one or two split
    points. No fitting, no data.
-4. **Replace comparisons 4 and 5 with RegMean++ (comparison 4').** Reuses the
-   activation shards already produced by comparison 1. Keep the per-tensor
-   classification manifest from the original plan.
-5. **Parameter-space and subspace merges for the retention side.** Model Stock,
+4. **Replace comparisons 4 and 5 with RegMean++.** Specified as comparison 6 in
+   `EXPERIMENTS_TODO.md`; design record and rejected alternatives in
+   `REGMEAN_INTERFACE_DESIGN.md`. Keep the per-tensor classification manifest
+   from the original plan. Note the cost correction above: ++ needs its own
+   forward passes, not comparison 1's shards.
+5. **Fit the interface end to end and ablate the merge.** Specified as
+   comparison 7. This promotes the trained stitch out of the contingency slot it
+   occupied below: SLAM-ASR-style projector training is no longer only an upper
+   baseline but arm E2, and because it leaves `PT_ML` byte-identical it may
+   subsume the merge entirely, which §2.4 already predicts.
+6. **Parameter-space and subspace merges for the retention side.** Model Stock,
    Karcher mean, Multi-SLERP, then BoostedTSV-M / Iso-C, guided by the ASR
    benchmark's split between in-domain and FLEURS retention.
-6. **If encoder-space merging still does not produce an assistant turn:** a
-   trained stitch, i.e. SLAM-ASR-style projector training, as the upper baseline
-   that says whether the interface is recoverable at all; and LegoSLM as the
-   architecture-level answer to encoder swapping. Both need new comparison slots
-   and both touch invariant 6.
+7. **If neither merging nor interface fitting produces an assistant turn:**
+   LegoSLM as the architecture-level answer to encoder swapping. A new
+   comparison slot, and an architecture change to the served graph.
 
-Steps 1--4 are training-free and stay inside the existing evaluation contract.
-Step 6 does not, and should not be started before steps 1--3 have said whether
-the interface or the merge is the binding constraint.
+Steps 1--4 and 6 are training-free and stay inside the existing evaluation
+contract. Step 5 is not: it needs the invariant 6 extension recorded in
+`AGENTS.md` and the language-model gating check described in
+`REGMEAN_INTERFACE_DESIGN.md` §11. Step 7 changes the served graph.
+
+The ordering above stays cheapest-first, but note that step 5's E1 and E2 arms
+answer the interface-versus-merge question directly, which is what steps 1--3
+exist to answer indirectly. If the diagnostics in steps 1--3 are inconclusive,
+step 5 is the more decisive route rather than the more expensive one.
 
 ## 6. Index
 

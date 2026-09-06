@@ -222,6 +222,12 @@ fitting run remains immutable; completion evidence is saved separately in
 
 ## 4. Dense activation-transported task vector
 
+> `LITERATURE.md` §3.3 proposes demoting comparisons 4 and 5 in favour of
+> comparison 6, on the grounds that closed-form merging reaches the same
+> output-matching objective without the structured-tensor routing problem. That
+> is a planning proposal only. Neither comparison is superseded until a decision
+> is recorded in `AGENTS.md`.
+
 Learn activation maps for every relevant internal representation and use them to transport the fine-tuning delta.
 
 - [ ] Collect paired `PT_EN`/`PT_ML` activations for:
@@ -295,16 +301,154 @@ Reuse comparison 4’s activation maps, but apply structurally incompatible para
 
 Done when the hybrid/full-transport difference is isolated and all tensor-routing decisions are reproducible.
 
+## 6. RegMean++ merge with the original projection
+
+Merge `PT_ML` and `FT_EN` in closed form and evaluate through the untouched
+VoiceChat interface. Training-free. This is arm **E0**, and it is the only new
+arm that needs no invariant change: `proj` is preserved exactly as invariant 6
+requires. Design record and rejected alternatives: `REGMEAN_INTERFACE_DESIGN.md`.
+
+- [ ] Freeze a SLURP manifest (English assistant audio) and a Speech-MASSIVE
+  fr/de/ru manifest through `manifests.write_frozen`, with the same
+  content-addressing and per-file SHA-256 verification as the existing
+  manifests. FLEURS must not appear in either.
+- [ ] Size Dataset A by dimension, not by the paper's literal 256 samples:
+  at least 4× the largest linear input dimension in frames, i.e. roughly
+  20--30 minutes of audio per candidate. Confirm `n_ff` = `intermediate_size`
+  from the configuration before fixing the count.
+- [ ] Collect \(G_F\) on SLURP `train` and \(G_M\) on Speech-MASSIVE `dev`,
+  kept separate. Never collect both on a shared English domain: with equal Gram
+  matrices Eq. 2 reduces exactly to the unweighted mean.
+- [ ] Normalize each \(G_i\) by frame count and equalize total frames across
+  candidates, so neither clip length nor collection volume acts as an
+  unintended merge coefficient.
+- [ ] Classify every encoder tensor as RegMean-merged or averaged, and assert
+  each appears exactly once. `conv.pointwise_conv{1,2}` are 1×1 convolutions
+  and belong on the RegMean path; `depthwise_conv`, the subsampling
+  convolutions, LayerNorms, `bias_u` and `bias_v` are averaged.
+- [ ] Implement RegMean++ Algorithm 1: for each depth, obtain the cross-layer
+  input from the **merged** prefix, run each candidate's own layer on it for the
+  intra-layer sub-module inputs, then solve Eq. 2 per linear layer. Budget \(L\)
+  sequential forward passes; the cached comparison 1 activation shards are
+  candidate-only and are **not** sufficient for the ++ variant.
+- [ ] Grid \(\alpha\in\{0.1,0.3,0.5,0.7,0.9,0.95\}\) on a held-out split.
+  Exclude \(\alpha=1.0\).
+- [ ] Record the merged depth range and module subset as declared choices. The
+  paper reports that middle and deep layers preserve >98% of the all-layer
+  result and that MLP linears outperform attention linears.
+- [ ] Build plain RegMean as a reference and simple averaging as arm **E4**'s
+  encoder, to separate the cross-layer correction from the Gram weighting.
+- [ ] Ablate LayerNorm handling: averaged, versus seeded from `FT_EN`.
+- [ ] Ablate the Gram data: re-collect \(G_M\) from CoVoST 2 / Common Voice
+  fr-de-ru and re-merge, replicating the paper's in-domain versus out-of-domain
+  sensitivity on this model.
+- [ ] Confirm the merged candidate inherits `PT_ML`'s complete runtime
+  configuration, including the 56-frame left context. Record that `FT_EN`'s
+  Gram contribution is therefore collected at a context it never saw.
+- [ ] Run the complete shared evaluation.
+- [ ] Quantize and reevaluate.
+- [ ] Run the paired speech-to-action tool-calling evaluation on the deployment
+  artifact.
+- [ ] Compare against comparison 1 and comparison 2 to isolate closed-form
+  merging from task arithmetic.
+
+Done when a training-free merge has been measured end to end through the
+original interface. Do not treat per-layer regression residuals as evidence of
+success: RegMean++ solves each layer greedily and does not control error at the
+encoder output, which is the only quantity the frozen language model reads.
+
+## 7. End-to-end interface fitting, and the merge ablation
+
+Fit `proj` by token cross-entropy through the frozen VoiceChat language model,
+and use it to ablate whether the merge of comparison 6 was needed at all.
+
+**Blocked** until a decision extending invariant 6 is recorded in `AGENTS.md`:
+all four arms train `proj` by gradient descent, which goes beyond the current
+"learned reverse activation map" clause. Extend once for all arms, not per arm.
+
+**Blocked** until the gating check passes: the frozen language model must read
+fr/de/ru text and answer in-language when instructed. If it will not, condition
+B has no teacher and must be reported as unavailable rather than trained.
+
+- [ ] Run the gating check: frozen LM, text-only, ~100 MASSIVE utterances per
+  language, both system prompts. Record whether it answers sensibly from native
+  text, replies in the input language under prompt B, and replies in English
+  under prompt A.
+- [ ] Freeze two system prompts as separate conditions: **A** "reply in English
+  only" and **B** "reply in the input language". Under invariant 9 these are two
+  comparison rows, not one row with a prompt column.
+- [ ] Build Dataset B on clips disjoint from Dataset A:
+  - **B1**, SLURP `val` audio, target = what the original VoiceChat emits on the
+    same clip. The original `proj` reaches zero loss on B1 by construction.
+  - **B2**, Speech-MASSIVE `dev` remainder, target = the frozen LM run text-only
+    on the **native-language** transcript under the condition's prompt.
+- [ ] Generate B2 targets from the target-language MASSIVE text, never from
+  `en-US`. MASSIVE localized rather than translated, so an `en-US`-derived
+  target names entities the foreign audio never contained.
+- [ ] Record MASSIVE's per-slot replacement method per utterance; it identifies
+  where the two output conditions are most likely to diverge.
+- [ ] Measure the text-path versus audio-path target gap on a small English
+  subset, so B1 and B2 losses are on a comparable scale.
+- [ ] Gate targets on output-language identification and report teacher quality
+  separately, establishing the distillation ceiling.
+- [ ] Train one shared `proj` across both conditions. `proj` never sees the
+  system prompt, so a single projection serves both; fitting condition A alone
+  would reward discarding language identity, which condition B forbids.
+- [ ] Keep English clips under both prompts as the control separating prompt
+  effect from input-language effect.
+- [ ] Precompute the frozen encoder's output once per clip and cache it, and
+  cache one prefix KV per system prompt. Neither depends on `proj`.
+- [ ] Run the four arms:
+  - **E1** `FT_EN` + trained `proj`, initialized at the original projection.
+  - **E2** `PT_ML` byte-identical + trained `proj`, initialized at comparison
+    3's folded map.
+  - **E3** the comparison 6 merge + trained `proj`, initialized at the original
+    projection.
+  - **E4** simple averaging + trained `proj`, initialized at the original
+    projection.
+- [ ] Run E1 first. It is a required control, not an optional extra: B2 targets
+  come from a multilingual language model, so foreign-audio performance must be
+  bounded against an English-only encoder before any of it is attributed to
+  `PT_ML`. It is also the pipeline check — if E1 does not at least match the
+  `FT_EN` control row on English, the training loop is broken and nothing
+  downstream is meaningful.
+- [ ] Run each arm at 25/50/100% of Dataset B and compare scaling curves, not
+  endpoints. The arms are asymmetrically data-sensitive: E3 needs a small
+  correction from a good prior while E2 must learn a much larger re-basing, so
+  at a fixed budget E3 is flattered. Dataset B is ~6.7 hours of unique audio
+  against SLAM-ASR's ~960.
+- [ ] Record the language-model precision used for fitting in each candidate's
+  provenance, and measure the NF4-versus-bf16 fitting gap on a few hundred
+  examples. Deployment runs Q8_0, so the fitting precision is an experimental
+  variable, not only an export stage.
+- [ ] Confirm encoder tensors remain byte-identical to their arm's source.
+- [ ] Run the complete shared evaluation for every arm and condition.
+- [ ] Score the held-out Speech-MASSIVE `test` split on both axes: output
+  language identification and intent/slot correctness from the inherited MASSIVE
+  labels.
+- [ ] Quantize and reevaluate.
+- [ ] Run the paired speech-to-action tool-calling evaluation per condition.
+
+Done when the four arms have been measured under both conditions with matched
+data budgets. E2 winning is a legitimate outcome and would mean the interface,
+not the merge, was the binding constraint, as `LITERATURE.md` §2.4 predicts. Do
+not report a merge advantage from endpoint scores alone.
+
 ## Final comparison
 
-- [ ] Produce one table containing comparisons 1–5 under identical manifests and precision.
+- [ ] Produce one table containing comparisons 1–7 under identical manifests and precision.
 - [ ] Report paired differences relative to `PT_ML`, not only absolute scores.
 - [ ] Separate results into:
   - English fine-tune transfer
   - intrinsic multilingual retention
   - VoiceChat-space cross-lingual alignment
   - layerwise transport fidelity
-  - quantization sensitivity
+  - quantization sensitivity, and separately the language-model precision used
+    for interface fitting
+  - interface fitting under both output-language conditions, reported as two
+    rows per invariant 9
+  - Speech-MASSIVE output-language identification and intent/slot correctness
+  - Dataset B scaling curves at 25/50/100%, not endpoint scores alone
   - paired English/Russian speech-to-action tool calling, against the `FT_EN`
     control row
 - [ ] Select a candidate only from development results.

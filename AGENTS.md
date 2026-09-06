@@ -10,6 +10,12 @@ the comparison slots. It is a planning document only: it never supersedes
 `EXPERIMENTS_TODO.md`, and naming a method there does not authorise changing a
 fixed sweep or an invariant without a decision recorded in this file.
 
+`REGMEAN_INTERFACE_DESIGN.md` is the design record behind comparisons 6 and 7:
+the merging objective, the rejected alternatives, the dataset composition, and
+the blocking checks. Read it before implementing either. Like `LITERATURE.md` it
+records no measurement, and comparison 7 stays blocked until the invariant 6
+extension it describes is decided here.
+
 ## What this repository is
 
 This is the research and checkpoint-export repository for replacing the
