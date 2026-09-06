@@ -493,16 +493,17 @@ FLEURS manifests.
 
 ## 14. Invariant impact
 
-- **Invariant 6** (preserve the original projection unless a comparison folds a
-  learned reverse activation map into it). E0 is inside it as written. E1--E4
-  train `proj` by gradient descent through the frozen LM, which goes beyond the
-  current "learned reverse activation map" clause. **Comparison 7 is blocked
-  until a decision extending invariant 6 is recorded in `AGENTS.md`.** All four
-  training arms depend on it equally, so it should be extended once for all of
-  them, not per arm.
-- **Invariant 3** needs extending so that the LM precision used for *fitting* is
-  recorded as an experimental variable, not only the export quantization stage
-  (§10).
+- **Invariant 6** has been extended to authorise a projection fitted by gradient
+  descent through the frozen language model, alongside comparison 3's
+  closed-form map. E0 was already inside it as written. The extension requires a
+  gradient-fitted projection to record its initialization, training manifest,
+  frozen system prompt and fitting precision, and to leave every `encoder.*`
+  tensor byte-identical to its arm's source; nothing else in the served graph may
+  be trained. Comparison 7 is therefore no longer blocked on governance, only on
+  the gating check in §11.
+- **Invariant 3** has been extended so that the LM precision used for *fitting*
+  is recorded in provenance and measured separately from the export quantization
+  stage (§10).
 - **Invariant 7** would need extending only if the per-candidate Gram weighting
   of §2 is used.
 - **Invariant 9** is respected by treating each system prompt as its own

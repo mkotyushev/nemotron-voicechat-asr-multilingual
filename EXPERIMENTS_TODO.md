@@ -362,9 +362,9 @@ encoder output, which is the only quantity the frozen language model reads.
 Fit `proj` by token cross-entropy through the frozen VoiceChat language model,
 and use it to ablate whether the merge of comparison 6 was needed at all.
 
-**Blocked** until a decision extending invariant 6 is recorded in `AGENTS.md`:
-all four arms train `proj` by gradient descent, which goes beyond the current
-"learned reverse activation map" clause. Extend once for all arms, not per arm.
+Invariant 6 authorises a gradient-fitted projection for this comparison, and
+invariant 3 requires the fitting precision to be recorded. Every arm below must
+carry the provenance those invariants name.
 
 **Blocked** until the gating check passes: the frozen language model must read
 fr/de/ru text and answer in-language when instructed. If it will not, condition

@@ -53,9 +53,13 @@ must follow `EXPERIMENTS_TODO.md` and `asr_align/experiments.py`.
 
 Shared setup and Comparisons 1--3 have validated artifacts and metrics.
 Comparison 3's completion evidence is indexed in `COMPARISON_3_RESULTS.md`.
-Comparisons 4--5 and the final comparison remain experimental work; do not mark
+Comparisons 4--7 and the final comparison remain experimental work; do not mark
 their result-oriented boxes complete without producing and validating the
 stated artifacts and metrics. Completion is not a claim of deployment quality.
+Comparison 6 is training-free and needs no invariant change. Comparison 7 is the
+only arm that trains anything; invariant 6 now authorises it, but it stays
+blocked until the language-model gating check in `REGMEAN_INTERFACE_DESIGN.md`
+§11 has been run.
 
 ## Source map
 
@@ -121,7 +125,11 @@ stated artifacts and metrics. Completion is not a claim of deployment quality.
    tensors.
 3. Perform arithmetic in F32 through `asr_align.experiments`. Load ASR sources
    with `mmproj_precision=False` and load FT_EN from the original NVIDIA
-   safetensors. Quantize only a final exported artifact, then evaluate it again.
+   safetensors. Quantize only a final exported artifact, then evaluate it again. When
+   a projection is fitted through the frozen language model, the language-model
+   precision used for fitting is itself an experimental variable: record it in
+   the candidate's provenance and measure its effect separately from the export
+   quantization stage.
 4. Never use a dequantized Q8_0 VoiceChat container as the FT_EN arithmetic or
    reference source. `load_container()` remains for runtime-parity and legacy
    analysis only. Use `load_voicechat_safetensors()` for FT_EN; any F16/Q8_0
@@ -132,8 +140,15 @@ stated artifacts and metrics. Completion is not a claim of deployment quality.
    from PT_EN or FT_EN. The known left contexts differ: PT_ML is 56 frames;
    PT_EN/FT_EN are 70.
 6. Preserve the original VoiceChat/FT_EN projection unless a comparison
-   explicitly folds a learned reverse activation map into it. The multilingual
-   checkpoint's language-prompt MLP is not part of the deployed VoiceChat graph.
+   explicitly fits a learned map and folds it in. Two forms are authorised: a
+   closed-form reverse activation map fitted on embeddings, as in comparison 3;
+   and a projection fitted by gradient descent through the frozen language
+   model, as in comparison 7. A gradient-fitted projection must record its
+   initialization, its frozen training manifest, the frozen system prompt it was
+   fitted under, and the language-model precision used for fitting, and must
+   leave every `encoder.*` tensor byte-identical to its arm's source. Nothing
+   else in the served graph may be trained. The multilingual checkpoint's
+   language-prompt MLP is not part of the deployed VoiceChat graph.
 7. Use the fixed lambda sweep from `asr_align.experiments`; do not add an ad hoc
    coefficient or select a final lambda before the specified development
    comparisons are complete.

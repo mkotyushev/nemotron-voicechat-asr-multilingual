@@ -435,9 +435,10 @@ repository already has.
    comparison slot, and an architecture change to the served graph.
 
 Steps 1--4 and 6 are training-free and stay inside the existing evaluation
-contract. Step 5 is not: it needs the invariant 6 extension recorded in
-`AGENTS.md` and the language-model gating check described in
-`REGMEAN_INTERFACE_DESIGN.md` §11. Step 7 changes the served graph.
+contract. Step 5 is not: invariants 3 and 6 have been extended in `AGENTS.md` to
+authorise it, but it remains blocked on the language-model gating check
+described in `REGMEAN_INTERFACE_DESIGN.md` §11. Step 7 changes the served
+graph.
 
 The ordering above stays cheapest-first, but note that step 5's E1 and E2 arms
 answer the interface-versus-merge question directly, which is what steps 1--3
