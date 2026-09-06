@@ -1,9 +1,11 @@
 # Design record: RegMean++ merging and end-to-end interface fitting
 
-Status: **design only.** No measurement in this document has been run. It
-specifies comparisons 6 and 7 of `EXPERIMENTS_TODO.md` and records the reasoning
-and the rejected alternatives behind them, so that the specification can be
-audited without reconstructing the argument.
+Status: **design, plus the §11 gating checks.** No merge, fit or candidate in
+this document has been run. The blocking checks of §11 have: their results are
+in `COMPARISON_7_GATE_RESULTS.md` and are summarised at the head of that
+section. Everything else specifies comparisons 6 and 7 of `EXPERIMENTS_TODO.md`
+and records the reasoning and the rejected alternatives behind them, so that the
+specification can be audited without reconstructing the argument.
 
 Scope. Comparisons 1--3 established that the *interface* — the 1024→4480
 `proj` into the VoiceChat language model's embedding space — is the currently
@@ -296,10 +298,13 @@ English clips are kept under **both** prompts even though their targets should
 coincide; that pair is the control separating "the prompt changed behaviour"
 from "the input language changed behaviour".
 
-**Blocking prerequisite.** This design assumes the frozen LM reads fr/de/ru
-*text* competently and will answer in-language when instructed. The recorded
-pilot only shows it answering in English from misheard audio, which says nothing
-about text-mode multilingual ability. See §11.
+**Blocking prerequisite — discharged.** This design assumed the frozen LM reads
+fr/de/ru *text* competently and will answer in-language when instructed. The
+recorded pilot only showed it answering in English from misheard audio, which
+said nothing about text-mode multilingual ability. §11 has now measured it: it
+does, through the chat format, on 0.90/0.85/0.82 of fr/de/ru utterances — and it
+does not through the deployment runtime's perception-channel text path, where
+Russian collapses to 0.07. Condition B exists; its teacher is the chat format.
 
 ---
 
@@ -423,6 +428,35 @@ job. Shorten the frozen prompt before adding hardware.
 
 ## 11. Blocking checks, to run before building anything
 
+**Run. Results in `COMPARISON_7_GATE_RESULTS.md`; comparison 7 is unblocked.**
+This section keeps its original text below, because what the checks were asked
+is part of the record; what they answered is summarised first.
+
+- **Condition B has a teacher, and only one.** Through the checkpoint's
+  inherited Nemotron-H chat format the model answers fr/de/ru in the language
+  it was addressed in on 0.90/0.85/0.82 of utterances after the §11.4 usability
+  gate, 0.95/0.90/0.94 before it. Through the deployment
+  runtime's own perception-channel text path it does not: Russian collapses to
+  0.07, answering in English 73% of the time and transliterating when it does
+  not. Same weights, same sentence — the input mode, not the model. B2 targets
+  must therefore be generated offline through the chat format.
+- **Condition A disobeys rather than fails.** It answers in the input language
+  on 15% of German and 9% of French utterances, never on Russian. §11.4's
+  output-language gate removes exactly those, at a cost of 0–16% of condition
+  A's foreign targets and 10–18% of condition B's.
+- **`n_ff` = `intermediate_size` = 4096 = 4·`n_embd`, but it is not the widest
+  linear.** `subsampling.linear` is, at d_in = 4352, so Dataset A needs
+  **17,408 frames = 23.2 minutes per candidate** — §5's estimate, made exact.
+- **B1 and B2 targets are not on one scale.** On 24 English clips the text
+  target shares a median unigram F1 of 0.41 with what VoiceChat itself says on
+  the same audio, and is a third longer. Equal term weights are not a
+  defensible default.
+- **Two constraints discovered on the way.** The pinned bridge's
+  `render_system_prompt` strips non-ASCII, so no foreign-language prompt can
+  reach the model through `/v1/realtime` at all; and the GGUF declares `</s>`
+  as end-of-turn while the chat format ends on `<SPECIAL_12>`, so text use
+  needs an explicit eos override or every reply runs to the token cap.
+
 1. **Does the frozen LM read fr/de/ru text and answer in-language?** Run it
    text-only on ~100 MASSIVE utterances per language under both system prompts.
    Check that it produces sensible answers from native text; that under prompt B
@@ -440,6 +474,15 @@ job. Shorten the frozen prompt before adding hardware.
 4. **Teacher quality gate.** If the LM's native-language generation is
    grammatical but weak, gate targets on output-language ID and report teacher
    quality as its own number, so the distillation ceiling is known.
+
+### 11.1 What §6 and §8 must now say
+
+§6's B2 line — "the frozen LM run text-only on the transcript" — was ambiguous
+between two input modes and is resolved: **the chat format**, not the
+perception channel. §8's blocking prerequisite is discharged. The teacher path
+joins the initialization, training manifest, frozen system prompt and fitting
+precision that invariant 6 already requires a gradient-fitted projection to
+record.
 
 ---
 

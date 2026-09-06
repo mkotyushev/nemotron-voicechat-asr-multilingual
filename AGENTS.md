@@ -12,9 +12,10 @@ fixed sweep or an invariant without a decision recorded in this file.
 
 `REGMEAN_INTERFACE_DESIGN.md` is the design record behind comparisons 6 and 7:
 the merging objective, the rejected alternatives, the dataset composition, and
-the blocking checks. Read it before implementing either. Like `LITERATURE.md` it
-records no measurement, and comparison 7 stays blocked until the invariant 6
-extension it describes is decided here.
+the blocking checks. Read it before implementing either. It records no
+measurement except the §11 gating checks, whose results are indexed in
+`COMPARISON_7_GATE_RESULTS.md`; invariant 6 already authorises comparison 7's
+projection, so that comparison is no longer blocked.
 
 ## What this repository is
 
@@ -57,9 +58,13 @@ Comparisons 4--7 and the final comparison remain experimental work; do not mark
 their result-oriented boxes complete without producing and validating the
 stated artifacts and metrics. Completion is not a claim of deployment quality.
 Comparison 6 is training-free and needs no invariant change. Comparison 7 is the
-only arm that trains anything; invariant 6 now authorises it, but it stays
-blocked until the language-model gating check in `REGMEAN_INTERFACE_DESIGN.md`
-§11 has been run.
+only arm that trains anything; invariant 6 authorises it and the language-model
+gating check in `REGMEAN_INTERFACE_DESIGN.md` §11 has been run, so it is
+unblocked. That check settled one thing the comparison must honour: the frozen
+language model answers fr/de/ru in-language through its inherited chat format
+but not through the deployment runtime's perception-channel text path, so
+condition B's targets are generated through the chat format and the teacher path
+is recorded in provenance. `COMPARISON_7_GATE_RESULTS.md` has the numbers.
 
 ## Source map
 
@@ -107,6 +112,12 @@ blocked until the language-model gating check in `REGMEAN_INTERFACE_DESIGN.md`
   embeddings; use it whenever graph, loading, precision, or export changes.
 - `convert_asr_to_mmproj.py`: dependency-light safetensors/GGUF conversion
   utilities also reused by `asr_align/weights.py`.
+- `lm_gating_check.py` and `asr_align/gating.py`: the blocking checks of
+  `REGMEAN_INTERFACE_DESIGN.md` §11 — the encoder-width confirmation that sizes
+  Comparison 6's Gram collection, the frozen MASSIVE sample, the two frozen
+  output-language system prompts, both frozen-language-model teacher paths, the
+  MASSIVE-fitted output-language identifier, the teacher-quality gate, and the
+  text-path versus audio-path target gap.
 - `tests/test_shared_setup.py`: unit coverage for shared invariants, manifests,
   and the evaluation contract.
 - `tests/test_voice_assistant.py`: unit coverage for the speech-to-action
@@ -114,6 +125,9 @@ blocked until the language-model gating check in `REGMEAN_INTERFACE_DESIGN.md`
 - `tests/test_final_map.py`: unit coverage for the final activation maps, the
   projection fold, the frozen activation-cache reader, and the Comparison 3
   delta table.
+- `tests/test_gating.py`: unit coverage for the encoder-width derivation, the
+  frozen gating sample, the output-language identifier, the reply-shape rules,
+  the per-cell rates, and the gate verdicts.
 
 ## Non-negotiable experiment invariants
 
@@ -145,8 +159,9 @@ blocked until the language-model gating check in `REGMEAN_INTERFACE_DESIGN.md`
    and a projection fitted by gradient descent through the frozen language
    model, as in comparison 7. A gradient-fitted projection must record its
    initialization, its frozen training manifest, the frozen system prompt it was
-   fitted under, and the language-model precision used for fitting, and must
-   leave every `encoder.*` tensor byte-identical to its arm's source. Nothing
+   fitted under, the language-model precision used for fitting, and the teacher
+   path its targets were generated through, and must leave every `encoder.*`
+   tensor byte-identical to its arm's source. Nothing
    else in the served graph may be trained. The multilingual checkpoint's
    language-prompt MLP is not part of the deployed VoiceChat graph.
 7. Use the fixed lambda sweep from `asr_align.experiments`; do not add an ad hoc

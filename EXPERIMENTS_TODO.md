@@ -314,8 +314,10 @@ requires. Design record and rejected alternatives: `REGMEAN_INTERFACE_DESIGN.md`
   manifests. FLEURS must not appear in either.
 - [ ] Size Dataset A by dimension, not by the paper's literal 256 samples:
   at least 4× the largest linear input dimension in frames, i.e. roughly
-  20--30 minutes of audio per candidate. Confirm `n_ff` = `intermediate_size`
-  from the configuration before fixing the count.
+  20--30 minutes of audio per candidate. `n_ff` = `intermediate_size` = 4096 is
+  confirmed, and the widest linear input is `subsampling.linear` at 4352, not
+  the FFN: the budget is **17,408 frames = 23.2 minutes per candidate**
+  (`COMPARISON_7_GATE_RESULTS.md`, check 2).
 - [ ] Collect \(G_F\) on SLURP `train` and \(G_M\) on Speech-MASSIVE `dev`,
   kept separate. Never collect both on a shared English domain: with equal Gram
   matrices Eq. 2 reduces exactly to the unweighted mean.
@@ -366,14 +368,22 @@ Invariant 6 authorises a gradient-fitted projection for this comparison, and
 invariant 3 requires the fitting precision to be recorded. Every arm below must
 carry the provenance those invariants name.
 
-**Blocked** until the gating check passes: the frozen language model must read
-fr/de/ru text and answer in-language when instructed. If it will not, condition
-B has no teacher and must be reported as unavailable rather than trained.
+**Unblocked.** The gating check has been run and condition B has a teacher:
+`COMPARISON_7_GATE_RESULTS.md`. It has one only through the checkpoint's
+inherited chat format — the deployment runtime's perception-channel text path
+answers Russian in the input language on 7% of utterances and must not be used
+to generate targets.
 
-- [ ] Run the gating check: frozen LM, text-only, ~100 MASSIVE utterances per
+- [x] Run the gating check: frozen LM, text-only, ~100 MASSIVE utterances per
   language, both system prompts. Record whether it answers sensibly from native
   text, replies in the input language under prompt B, and replies in English
-  under prompt A.
+  under prompt A. Both teacher paths were measured: in-language rates under
+  prompt B are fr 0.90 / de 0.85 / ru 0.82 usable on the chat format against
+  0.77 / 0.60 / 0.07 on the perception channel, and under prompt A the model
+  answers in the input language on 15% of German and 9% of French utterances.
+- [ ] Record the teacher path in each candidate's provenance alongside the
+  initialization, training manifest, frozen system prompt and fitting precision
+  invariant 6 requires. Generate B2 targets through the chat format.
 - [ ] Freeze two system prompts as separate conditions: **A** "reply in English
   only" and **B** "reply in the input language". Under invariant 9 these are two
   comparison rows, not one row with a prompt column.
@@ -387,10 +397,16 @@ B has no teacher and must be reported as unavailable rather than trained.
   target names entities the foreign audio never contained.
 - [ ] Record MASSIVE's per-slot replacement method per utterance; it identifies
   where the two output conditions are most likely to diverge.
-- [ ] Measure the text-path versus audio-path target gap on a small English
-  subset, so B1 and B2 losses are on a comparable scale.
-- [ ] Gate targets on output-language identification and report teacher quality
-  separately, establishing the distillation ceiling.
+- [x] Measure the text-path versus audio-path target gap on a small English
+  subset, so B1 and B2 losses are on a comparable scale. Measured on 24 English
+  BFCL clips disjoint from the frozen pilot: median unigram F1 0.41 against the
+  audio target, with the text target a third longer. Equal term weights are
+  therefore not a defensible default.
+- [x] Gate targets on output-language identification and report teacher quality
+  separately, establishing the distillation ceiling. The identifier is a
+  character-trigram naive Bayes fitted on MASSIVE `train`, 98.8% accurate on the
+  untouched `test` partition; the gate costs 0--16% of condition A's foreign
+  targets and 10--18% of condition B's.
 - [ ] Train one shared `proj` across both conditions. `proj` never sees the
   system prompt, so a single projection serves both; fitting condition A alone
   would reward discarding language identity, which condition B forbids.
