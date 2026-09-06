@@ -308,56 +308,93 @@ VoiceChat interface. Training-free. This is arm **E0**, and it is the only new
 arm that needs no invariant change: `proj` is preserved exactly as invariant 6
 requires. Design record and rejected alternatives: `REGMEAN_INTERFACE_DESIGN.md`.
 
-- [ ] Freeze a SLURP manifest (English assistant audio) and a Speech-MASSIVE
+- [x] Freeze a SLURP manifest (English assistant audio) and a Speech-MASSIVE
   fr/de/ru manifest through `manifests.write_frozen`, with the same
   content-addressing and per-file SHA-256 verification as the existing
   manifests. FLEURS must not appear in either.
-- [ ] Size Dataset A by dimension, not by the paper's literal 256 samples:
+- [x] Size Dataset A by dimension, not by the paper's literal 256 samples:
   at least 4× the largest linear input dimension in frames, i.e. roughly
   20--30 minutes of audio per candidate. `n_ff` = `intermediate_size` = 4096 is
   confirmed, and the widest linear input is `subsampling.linear` at 4352, not
   the FFN: the budget is **17,408 frames = 23.2 minutes per candidate**
   (`COMPARISON_7_GATE_RESULTS.md`, check 2).
-- [ ] Collect \(G_F\) on SLURP `train` and \(G_M\) on Speech-MASSIVE `dev`,
+- [x] Collect \(G_F\) on SLURP `train` and \(G_M\) on Speech-MASSIVE `dev`,
   kept separate. Never collect both on a shared English domain: with equal Gram
   matrices Eq. 2 reduces exactly to the unweighted mean.
-- [ ] Normalize each \(G_i\) by frame count and equalize total frames across
+- [x] Normalize each \(G_i\) by frame count and equalize total frames across
   candidates, so neither clip length nor collection volume acts as an
   unintended merge coefficient.
-- [ ] Classify every encoder tensor as RegMean-merged or averaged, and assert
+- [x] Classify every encoder tensor as RegMean-merged or averaged, and assert
   each appears exactly once. `conv.pointwise_conv{1,2}` are 1×1 convolutions
   and belong on the RegMean path; `depthwise_conv`, the subsampling
   convolutions, LayerNorms, `bias_u` and `bias_v` are averaged.
-- [ ] Implement RegMean++ Algorithm 1: for each depth, obtain the cross-layer
+- [x] Implement RegMean++ Algorithm 1: for each depth, obtain the cross-layer
   input from the **merged** prefix, run each candidate's own layer on it for the
   intra-layer sub-module inputs, then solve Eq. 2 per linear layer. Budget \(L\)
   sequential forward passes; the cached comparison 1 activation shards are
   candidate-only and are **not** sufficient for the ++ variant.
-- [ ] Grid \(\alpha\in\{0.1,0.3,0.5,0.7,0.9,0.95\}\) on a held-out split.
+- [x] Grid \(\alpha\in\{0.1,0.3,0.5,0.7,0.9,0.95\}\) on a held-out split.
   Exclude \(\alpha=1.0\).
-- [ ] Record the merged depth range and module subset as declared choices. The
+- [x] Record the merged depth range and module subset as declared choices. The
   paper reports that middle and deep layers preserve >98% of the all-layer
   result and that MLP linears outperform attention linears.
-- [ ] Build plain RegMean as a reference and simple averaging as arm **E4**'s
+- [x] Build plain RegMean as a reference and simple averaging as arm **E4**'s
   encoder, to separate the cross-layer correction from the Gram weighting.
-- [ ] Ablate LayerNorm handling: averaged, versus seeded from `FT_EN`.
-- [ ] Ablate the Gram data: re-collect \(G_M\) from CoVoST 2 / Common Voice
+- [x] Ablate LayerNorm handling: averaged, versus seeded from `FT_EN`.
+- [x] Ablate the Gram data: re-collect \(G_M\) from CoVoST 2 / Common Voice
   fr-de-ru and re-merge, replicating the paper's in-domain versus out-of-domain
   sensitivity on this model.
-- [ ] Confirm the merged candidate inherits `PT_ML`'s complete runtime
+- [x] Confirm the merged candidate inherits `PT_ML`'s complete runtime
   configuration, including the 56-frame left context. Record that `FT_EN`'s
   Gram contribution is therefore collected at a context it never saw.
-- [ ] Run the complete shared evaluation.
-- [ ] Quantize and reevaluate.
-- [ ] Run the paired speech-to-action tool-calling evaluation on the deployment
+- [x] Run the complete shared evaluation.
+- [x] Quantize and reevaluate.
+- [x] Run the paired speech-to-action tool-calling evaluation on the deployment
   artifact.
-- [ ] Compare against comparison 1 and comparison 2 to isolate closed-form
+- [x] Compare against comparison 1 and comparison 2 to isolate closed-form
   merging from task arithmetic.
 
 Done when a training-free merge has been measured end to end through the
 original interface. Do not treat per-layer regression residuals as evidence of
 success: RegMean++ solves each layer greedily and does not control error at the
 encoder output, which is the only quantity the frozen language model reads.
+
+Implemented by `regmean_merge.py` and `asr_align/regmean.py`, with Dataset A
+frozen by `dataset_a.py`. The validated run is recorded under the ignored
+experiment output named in its `run.json`; every result is paired against the
+exact frozen Comparison 1 arrays.
+
+`alpha = 0.3` was selected on 112 held-out Dataset A clips per candidate by
+agreement at the encoder output. The criterion has an interior peak: the English
+and multilingual sides move monotonically in opposite directions across the grid.
+All 636 canonical tensors are routed exactly once, 265 RegMean-solved and 371
+averaged, and the Gram reaches 4.006 rows per input dimension at the widest
+linear.
+
+The merge is the first candidate whose English VoiceChat-space R² against
+`FT_EN` is positive: -0.700806 to +0.002634, paired 95% CI [+0.6967, +0.7097],
+against comparison 3's -0.023870. It is also the first arm to pay a measured
+multilingual cost. Historical centered FLEURS top-1 falls by 0.180 (fr) and
+0.120 (de) with intervals excluding zero; Russian's interval contains zero.
+Intrinsic retrieval is preserved for fr/ru and degrades for de. That is the
+Pareto tradeoff comparison 3 avoided by leaving the encoder untouched.
+
+On the frozen speech-to-action pilot the merge makes **3 of 6 exact English
+calls** against the `FT_EN` control's 4 and comparison 3's 1, the largest
+movement any arm has produced on the primary endpoint. Russian remains 0 of 6
+and produces no assistant turn at all. Paired Russian-minus-English is -0.5,
+95% CI [-0.833, -0.167].
+
+Three ablations are negative results and are recorded as such: simple averaging
+beats RegMean++ on the selection criterion, an off-domain Common Voice `G_M`
+beats the in-domain one, and seeding LayerNorms from `FT_EN` collapses
+multilingual agreement. Plain RegMean is worse than RegMean++, so the
+cross-layer correction does help. The unridged Eq. 2 solve produced weights
+8.3e14 times `PT_ML`'s norm out of Gram round-off, so the solve is for the offset
+from the candidates' mean with a recorded relative ridge.
+
+[The Comparison 6 report](COMPARISON_6_RESULTS.md) indexes the frozen artifacts,
+commands, hashes, metrics and limits.
 
 ## 7. End-to-end interface fitting, and the merge ablation
 

@@ -13,7 +13,7 @@ import json
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .experiments import ExperimentValidationError, sha256_file, stable_json_sha256
 
@@ -382,6 +382,9 @@ def verify_audio_files(payload: Mapping[str, Any], *, root: Path | None = None) 
             for row in payload["pairs"][language]
             for take in ("english_reference", "english_query", "foreign_query")
         ]
+    elif payload.get("role") == "dataset_a":
+        validate_dataset_a_manifest(payload)
+        records = dataset_a_records(payload)
     else:
         raise ExperimentValidationError("cannot verify files for an unknown manifest dataset")
     seen: set[str] = set()
@@ -407,4 +410,283 @@ def assert_model_selection_source(dataset: str, split: str) -> None:
         raise ExperimentValidationError(
             "maps may be fit and regularization selected only on LibriSpeech "
             "map_train/validation; FLEURS is evaluation-only"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dataset A -- Comparison 6's Gram collection
+#
+# RegMean weights each candidate by where in input space that candidate is the
+# authority, so the two Gram sets must be *different* audio: English assistant
+# speech for FT_EN, the same task in other languages for PT_ML.  Collecting both
+# on shared audio would make the two Grams coincide and reduce Eq. 2 exactly to
+# the unweighted mean, which is the one configuration that measures nothing.
+#
+# Both corpora arrive packed -- SLURP as a tarball of FLAC, Speech-MASSIVE as
+# 48 kHz WAV inside parquet -- so ``root`` here is a prepared directory of
+# 16 kHz mono clips rather than an upstream download, and the manifest records
+# the archive hashes and the extraction rule alongside the per-clip SHA-256.
+# ---------------------------------------------------------------------------
+
+DATASET_A_SPLITS = ("gram", "heldout")
+DATASET_A_DATASETS = ("SLURP", "Speech-MASSIVE", "CommonVoice")
+
+
+def _dataset_a_payload(
+    dataset: str,
+    root: Path,
+    *,
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    source: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    seconds: float,
+    seed: int,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    from .data import SAMPLE_RATE
+
+    if dataset not in DATASET_A_DATASETS:
+        raise ExperimentValidationError(f"{dataset} is not a Dataset A corpus")
+    if set(splits) != set(DATASET_A_SPLITS):
+        raise ExperimentValidationError(
+            f"Dataset A needs exactly the splits {DATASET_A_SPLITS}"
+        )
+    payload = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "dataset": dataset,
+        "role": "dataset_a",
+        "comparison": 6,
+        "root": str(root.resolve()),
+        "sample_rate": SAMPLE_RATE,
+        "crop_seconds": seconds,
+        "seed": seed,
+        "source": dict(source),
+        "selection": {**dict(selection), "audio_hash": "sha256"},
+        "splits": {name: [dict(record) for record in splits[name]] for name in DATASET_A_SPLITS},
+        "policy": {
+            "gram_collection": "gram",
+            "alpha_selection": "heldout",
+            "fleurs_excluded": True,
+            "librispeech_excluded": True,
+        },
+        **dict(extra or {}),
+    }
+    return _with_digest(payload)
+
+
+def _validate_dataset_a(payload: Mapping[str, Any], dataset: str, required: set[str]) -> None:
+    _verify_digest(payload)
+    if payload.get("dataset") != dataset or payload.get("role") != "dataset_a":
+        raise ExperimentValidationError(f"not a Dataset A {dataset} manifest")
+    splits = payload.get("splits")
+    if not isinstance(splits, dict) or set(splits) != set(DATASET_A_SPLITS):
+        raise ExperimentValidationError(f"Dataset A needs exactly the splits {DATASET_A_SPLITS}")
+    seen: set[str] = set()
+    utterances: set[str] = set()
+    for split in DATASET_A_SPLITS:
+        records = splits[split]
+        if not isinstance(records, list) or not records:
+            raise ExperimentValidationError(f"{dataset} {split} is empty")
+        for record in records:
+            missing = required - set(record)
+            if missing:
+                raise ExperimentValidationError(
+                    f"{dataset} {split} record misses {sorted(missing)}"
+                )
+            relative = Path(str(record["path"]))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ExperimentValidationError(f"unsafe manifest path {relative}")
+            if record["path"] in seen:
+                raise ExperimentValidationError(
+                    f"recording appears in more than one Dataset A split: {record['path']}"
+                )
+            seen.add(record["path"])
+            key = f"{record.get('language', '')}:{record['utterance_id']}"
+            if key in utterances:
+                raise ExperimentValidationError(
+                    f"{dataset} utterance appears twice: {key}"
+                )
+            utterances.add(key)
+            if int(record["n_samples"]) <= 0 or int(record["offset"]) < 0:
+                raise ExperimentValidationError(f"{dataset} record has an invalid crop")
+
+
+SLURP_RECORD_FIELDS = {
+    "path", "utterance_id", "slurp_id", "recording", "intent", "scenario",
+    "offset", "n_samples", "source_frames", "bytes", "sha256",
+}
+SPEECH_MASSIVE_RECORD_FIELDS = {
+    "path", "utterance_id", "language", "intent", "speaker_id",
+    "offset", "n_samples", "source_frames", "bytes", "sha256",
+}
+# Common Voice is read speech with no task annotation, which is the point of
+# the ablation: it is off-domain for the assistant task in exactly the way the
+# paper's ImageNet substitution is off-domain for its tasks.
+COMMON_VOICE_RECORD_FIELDS = {
+    "path", "utterance_id", "language",
+    "offset", "n_samples", "source_frames", "bytes", "sha256",
+}
+
+
+def build_slurp_manifest(
+    root: Path,
+    *,
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    source: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    seconds: float,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Freeze the English assistant clips that produce ``G_F``."""
+
+    payload = _dataset_a_payload(
+        "SLURP",
+        root,
+        splits=splits,
+        source=source,
+        selection=selection,
+        seconds=seconds,
+        seed=seed,
+        extra={"candidate": "F/FT_EN", "language": "en-US"},
+    )
+    validate_slurp_manifest(payload)
+    return payload
+
+
+def validate_slurp_manifest(payload: Mapping[str, Any]) -> None:
+    _validate_dataset_a(payload, "SLURP", SLURP_RECORD_FIELDS)
+    if payload.get("candidate") != "F/FT_EN":
+        raise ExperimentValidationError("the SLURP Gram set belongs to F/FT_EN")
+
+
+def build_speech_massive_manifest(
+    root: Path,
+    *,
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    source: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    languages: Sequence[str],
+    seconds: float,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Freeze the fr/de/ru clips that produce ``G_M``."""
+
+    languages = list(dict.fromkeys(languages))
+    if not languages:
+        raise ExperimentValidationError("Speech-MASSIVE needs at least one language")
+    payload = _dataset_a_payload(
+        "Speech-MASSIVE",
+        root,
+        splits=splits,
+        source=source,
+        selection=selection,
+        seconds=seconds,
+        seed=seed,
+        extra={"candidate": "M/PT_ML", "languages": languages},
+    )
+    validate_speech_massive_manifest(payload)
+    return payload
+
+
+def validate_speech_massive_manifest(payload: Mapping[str, Any]) -> None:
+    _validate_dataset_a(payload, "Speech-MASSIVE", SPEECH_MASSIVE_RECORD_FIELDS)
+    if payload.get("candidate") != "M/PT_ML":
+        raise ExperimentValidationError("the Speech-MASSIVE Gram set belongs to M/PT_ML")
+    languages = payload.get("languages")
+    if not isinstance(languages, list) or not languages:
+        raise ExperimentValidationError("Speech-MASSIVE manifest declares no languages")
+    for split in DATASET_A_SPLITS:
+        present = {str(record["language"]) for record in payload["splits"][split]}
+        if not present <= set(languages):
+            raise ExperimentValidationError(
+                f"Speech-MASSIVE {split} contains undeclared languages {sorted(present - set(languages))}"
+            )
+        if present != set(languages):
+            raise ExperimentValidationError(
+                f"Speech-MASSIVE {split} omits {sorted(set(languages) - present)}; "
+                "the multilingual Gram must not be one language's"
+            )
+
+
+def build_common_voice_manifest(
+    root: Path,
+    *,
+    splits: Mapping[str, Sequence[Mapping[str, Any]]],
+    source: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    languages: Sequence[str],
+    seconds: float,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Freeze the off-domain fr/de/ru clips for the Gram-data ablation."""
+
+    languages = list(dict.fromkeys(languages))
+    if not languages:
+        raise ExperimentValidationError("Common Voice needs at least one language")
+    payload = _dataset_a_payload(
+        "CommonVoice",
+        root,
+        splits=splits,
+        source=source,
+        selection=selection,
+        seconds=seconds,
+        seed=seed,
+        extra={
+            "candidate": "M/PT_ML",
+            "languages": languages,
+            "role_note": (
+                "the off-domain substitute for G_M; general read speech rather "
+                "than the assistant task Speech-MASSIVE shares with SLURP"
+            ),
+        },
+    )
+    validate_common_voice_manifest(payload)
+    return payload
+
+
+def validate_common_voice_manifest(payload: Mapping[str, Any]) -> None:
+    _validate_dataset_a(payload, "CommonVoice", COMMON_VOICE_RECORD_FIELDS)
+    if payload.get("candidate") != "M/PT_ML":
+        raise ExperimentValidationError("the Common Voice Gram set belongs to M/PT_ML")
+    languages = payload.get("languages")
+    if not isinstance(languages, list) or not languages:
+        raise ExperimentValidationError("Common Voice manifest declares no languages")
+    for split in DATASET_A_SPLITS:
+        present = {str(record["language"]) for record in payload["splits"][split]}
+        if present != set(languages):
+            raise ExperimentValidationError(
+                f"Common Voice {split} does not cover exactly {sorted(languages)}"
+            )
+
+
+def dataset_a_records(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    validate_dataset_a_manifest(payload)
+    return [record for split in DATASET_A_SPLITS for record in payload["splits"][split]]
+
+
+def validate_dataset_a_manifest(payload: Mapping[str, Any]) -> None:
+    dataset = payload.get("dataset")
+    if dataset == "SLURP":
+        validate_slurp_manifest(payload)
+    elif dataset == "Speech-MASSIVE":
+        validate_speech_massive_manifest(payload)
+    elif dataset == "CommonVoice":
+        validate_common_voice_manifest(payload)
+    else:
+        raise ExperimentValidationError(f"{dataset!r} is not a Dataset A corpus")
+
+
+def assert_merge_selection_source(dataset: str, split: str) -> None:
+    """One guard for Comparison 6's alpha grid, mirroring the map-fitting guard.
+
+    FLEURS is the invariant most at risk in this comparison: it is already
+    manifested, already loaded by every other runner, and the obvious wrong
+    choice for both Gram collection and shrinkage selection.
+    """
+
+    if dataset not in DATASET_A_DATASETS or split != "heldout":
+        raise ExperimentValidationError(
+            "the RegMean shrinkage may be selected only on a held-out Dataset A "
+            "split; FLEURS is evaluation-only and LibriSpeech belongs to the "
+            "activation-map comparisons"
         )

@@ -39,8 +39,8 @@ def _parser() -> argparse.ArgumentParser:
     role.add_argument(
         "--comparison",
         type=int,
-        choices=range(1, 6),
-        help="score a candidate produced by one of comparisons 1-5",
+        choices=voice_assistant.COMPARISONS,
+        help="score a candidate produced by one of the comparisons",
     )
     role.add_argument(
         "--control",

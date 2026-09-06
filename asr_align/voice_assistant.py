@@ -32,6 +32,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .evaluation import COMPARISONS
 from .experiments import ExperimentValidationError, sha256_file, stable_json_sha256
 from .manifests import write_frozen
 
@@ -1607,8 +1608,10 @@ def validate_candidate(candidate: Mapping[str, Any]) -> None:
     if candidate.get("precision") not in PRECISIONS:
         raise ExperimentValidationError("candidate precision must be explicit")
     if role == "comparison":
-        if candidate.get("comparison") not in {1, 2, 3, 4, 5}:
-            raise ExperimentValidationError("a comparison row must name comparison 1-5")
+        if candidate.get("comparison") not in COMPARISONS:
+            raise ExperimentValidationError(
+                f"a comparison row must name one of comparisons {COMPARISONS}"
+            )
         shared_setup = candidate.get("shared_setup")
         if not isinstance(shared_setup, dict) or "sha256" not in shared_setup:
             raise ExperimentValidationError(
@@ -1618,7 +1621,7 @@ def validate_candidate(candidate: Mapping[str, Any]) -> None:
         if not str(candidate.get("control", "")).strip():
             raise ExperimentValidationError("a control row must name what it controls for")
         if candidate.get("comparison") is not None:
-            raise ExperimentValidationError("a control row is not one of comparisons 1-5")
+            raise ExperimentValidationError("a control row is not one of the comparisons")
     artifact = candidate.get("artifact")
     if not isinstance(artifact, dict) or "sha256" not in artifact:
         raise ExperimentValidationError("candidate must pin the served artifact by hash")

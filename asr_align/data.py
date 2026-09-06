@@ -150,3 +150,35 @@ def from_frozen_manifest(
             clips.append(Clip(resolved, int(record["offset"]), int(record["n_samples"])))
         result[split_name] = clips
     return result
+
+
+def from_dataset_a_manifest(
+    path: Path, *, split: str, root: Path | None = None
+) -> list[Clip]:
+    """Load one frozen Comparison 6 Gram split.
+
+    The manifest is verified before any audio is read, and ``split`` is the
+    experimental boundary: ``gram`` is what Eq. 2 sees and ``heldout`` is the
+    only thing the shrinkage may be selected on.
+    """
+
+    from .manifests import (
+        DATASET_A_SPLITS,
+        load_manifest,
+        validate_dataset_a_manifest,
+        verify_audio_files,
+    )
+
+    payload = load_manifest(path)
+    validate_dataset_a_manifest(payload)
+    if split not in DATASET_A_SPLITS:
+        raise SystemExit(f"{split!r} is not one of the Dataset A splits {DATASET_A_SPLITS}")
+    source_root = (root or Path(payload["root"])).resolve()
+    verify_audio_files(payload, root=source_root)
+    clips = []
+    for record in payload["splits"][split]:
+        resolved = source_root / Path(record["path"])
+        if not resolved.is_file():
+            raise SystemExit(f"frozen Dataset A recording is missing: {resolved}")
+        clips.append(Clip(resolved, int(record["offset"]), int(record["n_samples"])))
+    return clips

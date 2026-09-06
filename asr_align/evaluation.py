@@ -1,4 +1,4 @@
-"""One evaluator and one result contract for comparisons 1--5.
+"""One evaluator and one result contract for comparisons 1--7.
 
 All confidence intervals resample matched evaluation units with one set of
 indices for the candidate and PT_ML reference.  Consequently the reported
@@ -16,7 +16,15 @@ import numpy as np
 
 from .experiments import ExperimentValidationError, LAMBDAS
 
-RESULT_SCHEMA_VERSION = "1.0"
+# 1.1 adds comparisons 6 and 7, whose candidates are not points on the lambda
+# sweep, so ``lambda`` became nullable.  Nothing else moved, and the frozen 1.0
+# records of comparisons 1--3 stay valid rather than being rewritten: they are
+# write-once artifacts and a migration would break their recorded hashes.
+RESULT_SCHEMA_VERSION = "1.1"
+SUPPORTED_RESULT_SCHEMA_VERSIONS = ("1.0", "1.1")
+COMPARISONS = tuple(range(1, 8))
+#: Comparisons whose candidates are indexed by the frozen lambda sweep.
+LAMBDA_COMPARISONS = tuple(range(1, 6))
 PRECISION_STAGES = ("pre_quantization", "post_quantization")
 RETRIEVAL_TASKS = (
     "candidate_on_english_retrieval",
@@ -269,7 +277,7 @@ def evaluate_candidate(
     *,
     comparison: int,
     candidate_id: str,
-    weight: float,
+    weight: float | None,
     precision: str,
     english_prediction: np.ndarray,
     english_target: np.ndarray,
@@ -288,6 +296,9 @@ def evaluate_candidate(
 ) -> dict[str, Any]:
     """Run every shared metric and return the versioned comparison record.
 
+    ``weight`` is the lambda for comparisons 1--5 and ``None`` for the closed-form
+    merge and the trained interface, which are not points on that sweep.
+
     Each retrieval tuple is either ``(candidate_probe, candidate_reference,
     pt_ml_probe)`` when both candidates share a fixed reference, or the same
     tuple plus ``pt_ml_reference`` when the PT_ML baseline has its own frozen
@@ -296,10 +307,18 @@ def evaluate_candidate(
     English or locale names for FLEURS.
     """
 
-    if comparison not in range(1, 6):
-        raise ExperimentValidationError("comparison must be between 1 and 5")
-    if float(weight) not in LAMBDAS:
-        raise ExperimentValidationError(f"lambda={weight} is outside the frozen sweep")
+    if comparison not in COMPARISONS:
+        raise ExperimentValidationError(f"comparison must be one of {COMPARISONS}")
+    if comparison in LAMBDA_COMPARISONS:
+        if weight is None or float(weight) not in LAMBDAS:
+            raise ExperimentValidationError(f"lambda={weight} is outside the frozen sweep")
+    elif weight is not None:
+        # A closed-form merge and a trained interface have no position on the
+        # sweep; giving them one would put an unrelated coefficient in the
+        # column the final comparison reads.
+        raise ExperimentValidationError(
+            f"comparison {comparison} has no lambda; pass weight=None"
+        )
     if precision not in PRECISION_STAGES:
         raise ExperimentValidationError(f"precision must be one of {PRECISION_STAGES}")
     if set(manifest_hashes) != {"librispeech", "fleurs"}:
@@ -344,7 +363,7 @@ def evaluate_candidate(
         "schema_version": RESULT_SCHEMA_VERSION,
         "comparison": comparison,
         "candidate_id": candidate_id,
-        "lambda": float(weight),
+        "lambda": None if weight is None else float(weight),
         "precision": precision,
         "manifests": dict(manifest_hashes),
         "selection_policy": {
@@ -365,7 +384,7 @@ def evaluate_candidate(
 def validate_result(result: Mapping[str, Any]) -> None:
     """Validate the stable result fields consumed by the final comparison."""
 
-    if result.get("schema_version") != RESULT_SCHEMA_VERSION:
+    if result.get("schema_version") not in SUPPORTED_RESULT_SCHEMA_VERSIONS:
         raise ExperimentValidationError("unsupported result schema")
     if result.get("precision") not in PRECISION_STAGES:
         raise ExperimentValidationError("result has invalid precision stage")
@@ -402,7 +421,7 @@ def validate_precision_pair(
         raise ExperimentValidationError("first result is not pre_quantization")
     if post_quantization["precision"] != "post_quantization":
         raise ExperimentValidationError("second result is not post_quantization")
-    for field in ("comparison", "candidate_id", "lambda", "manifests"):
+    for field in ("schema_version", "comparison", "candidate_id", "lambda", "manifests"):
         if pre_quantization.get(field) != post_quantization.get(field):
             raise ExperimentValidationError(
                 f"pre/post quantization records differ in {field}; they are not a valid pair"

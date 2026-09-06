@@ -52,15 +52,25 @@ docstring of `asr_align/fuse.py` (`VC + lambda * (ML - EN)`). The reusable
 transport/rebase code in that module is still relevant, but new comparison code
 must follow `EXPERIMENTS_TODO.md` and `asr_align/experiments.py`.
 
-Shared setup and Comparisons 1--3 have validated artifacts and metrics.
-Comparison 3's completion evidence is indexed in `COMPARISON_3_RESULTS.md`.
-Comparisons 4--7 and the final comparison remain experimental work; do not mark
-their result-oriented boxes complete without producing and validating the
-stated artifacts and metrics. Completion is not a claim of deployment quality.
-Comparison 6 is training-free and needs no invariant change. Comparison 7 is the
-only arm that trains anything; invariant 6 authorises it and the language-model
-gating check in `REGMEAN_INTERFACE_DESIGN.md` §11 has been run, so it is
-unblocked. That check settled one thing the comparison must honour: the frozen
+Shared setup and Comparisons 1--3 and 6 have validated artifacts and metrics.
+Their completion evidence is indexed in `COMPARISON_3_RESULTS.md` and
+`COMPARISON_6_RESULTS.md`. Comparisons 4, 5, 7 and the final comparison remain
+experimental work; do not mark their result-oriented boxes complete without
+producing and validating the stated artifacts and metrics. Completion is not a
+claim of deployment quality.
+
+Comparison 6 needed no invariant change and made none: `proj` is the untouched
+`FT_EN` projection and nothing is trained. It is currently the strongest arm on
+both the English interface metric and the speech-to-action endpoint, and the
+first to pay a measured multilingual cost. Two of its recorded results should
+shape what comes next rather than be rediscovered: **simple averaging beat
+RegMean++ on the selection criterion**, and an **off-domain Common Voice Gram
+beat the in-domain Speech-MASSIVE one**, which is the opposite of the paper's
+Table 5 direction. Comparison 7's arm `E4` is therefore not a formality.
+
+Comparison 7 is the only arm that trains anything; invariant 6 authorises it and
+the language-model gating check in `REGMEAN_INTERFACE_DESIGN.md` §11 has been
+run, so it is unblocked. That check settled one thing the comparison must honour: the frozen
 language model answers fr/de/ru in-language through its inherited chat format
 but not through the deployment runtime's perception-channel text path, so
 condition B's targets are generated through the chat format and the teacher path
@@ -112,6 +122,20 @@ is recorded in provenance. `COMPARISON_7_GATE_RESULTS.md` has the numbers.
   embeddings; use it whenever graph, loading, precision, or export changes.
 - `convert_asr_to_mmproj.py`: dependency-light safetensors/GGUF conversion
   utilities also reused by `asr_align/weights.py`.
+- `dataset_a.py`: freezes Comparison 6's Gram audio. Extracts SLURP English
+  assistant clips from the Zenodo tarball and Speech-MASSIVE fr/de/ru clips from
+  the published parquet shards, resamples to 16 kHz, writes fixed-length crops,
+  and freezes one manifest per corpus through `manifests.write_frozen`.
+  `--common-voice` freezes the same budget from Common Voice instead, which is
+  the off-domain Gram ablation. FLEURS and LibriSpeech appear in neither.
+- `regmean_merge.py` and `asr_align/regmean.py`: the Comparison 6 runner and the
+  closed-form merge. Tensor routing with an exactly-once assertion,
+  frame-normalized Gram accumulation, Eq. 2 with the alpha shrinkage,
+  RegMean++ Algorithm 1 in depth order, plain RegMean and simple averaging as
+  reference arms, the LayerNorm-seeding ablation, held-out encoder-output
+  agreement, and the delta table against comparisons 1 and 2. Nothing here is
+  trained and `proj` is never touched. The evaluation passes are imported from
+  the Comparison 2 runner so every arm's rows come from the same code.
 - `lm_gating_check.py` and `asr_align/gating.py`: the blocking checks of
   `REGMEAN_INTERFACE_DESIGN.md` §11 — the encoder-width confirmation that sizes
   Comparison 6's Gram collection, the frozen MASSIVE sample, the two frozen
@@ -128,6 +152,10 @@ is recorded in provenance. `COMPARISON_7_GATE_RESULTS.md` has the numbers.
 - `tests/test_gating.py`: unit coverage for the encoder-width derivation, the
   frozen gating sample, the output-language identifier, the reply-shape rules,
   the per-cell rates, and the gate verdicts.
+- `tests/test_regmean.py`: unit coverage for the tensor routing, the Gram
+  normalization, Eq. 2 against a brute-force solve, the collapse onto the
+  unweighted mean when the Grams coincide, the merge driver, the Dataset A
+  manifests, and the extended result contract.
 
 ## Non-negotiable experiment invariants
 
@@ -291,6 +319,13 @@ manifest hashes, artifact hashes, precision stage, metrics, and reusable
 embedding/activation outputs required by `EXPERIMENTS_TODO.md`.
 
 ## First steps for the next comparison
+
+`simple-average`'s exported artifact in the Comparison 6 output is arm `E4`'s
+encoder for Comparison 7 and is already evaluated pre-quantization; reuse it
+rather than rebuilding it. Comparison 6 also freezes Dataset A, whose SLURP
+`train` and Speech-MASSIVE `dev` draws Comparison 7's Dataset B must stay
+disjoint from: the utterance ids are in the frozen manifests under
+`.cache/experiments/dataset-a-v1/`.
 
 Comparison 4 starts from the same frozen setup and Comparison 1 references.
 Reuse Comparison 3's selected final reverse map in the projection and verify

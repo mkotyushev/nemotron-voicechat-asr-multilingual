@@ -41,6 +41,7 @@ _ALIGNMENT = "alignment.json"
 _BASELINE = "baseline.json"
 _DIRECT = "direct_task_arithmetic.json"
 _FINAL_MAP = "final_activation_map.json"
+_REGMEAN = "regmean_merge.json"
 
 # The published repo each config belongs to. The local directory name is not it
 # -- download.sh chooses that -- and a model card gets read by someone who wants
@@ -159,6 +160,23 @@ def export(
                 "configuration are unchanged. See final_activation_map.json."
             ),
         }
+    elif artifact_kind == "regmean_merge":
+        config["voicechat_regmean_merge"] = {
+            "comparison": 6,
+            "method": report.get("method"),
+            "alpha": report.get("alpha"),
+            "formula": "W_M = [sum_i G_i]^-1 sum_i G_i W_i, per dense linear",
+            "projection_dim": int(proj_weight.shape[0]),
+            "alignment_map": None,
+            "note": (
+                "Canonical encoder.* tensors are a closed-form merge of PT_ML and "
+                "FT_EN: dense linears by Eq. 2 against per-candidate Gram matrices, "
+                "everything else by simple average. Nothing was trained. proj.* and "
+                "the featurizer are exact copies of the FT_EN VoiceChat source and "
+                "the complete runtime configuration comes from PT_ML. See "
+                "regmean_merge.json."
+            ),
+        }
     else:
         config["voicechat_alignment"] = {
             "map": report.get("map"),
@@ -190,6 +208,11 @@ def export(
     elif artifact_kind == "final_activation_map":
         (output / _FINAL_MAP).write_text(json.dumps(report, indent=2) + "\n")
         card = final_map_model_card(
+            output.name, UPSTREAM.get(config.get("model_type", "")), report
+        )
+    elif artifact_kind == "regmean_merge":
+        (output / _REGMEAN).write_text(json.dumps(report, indent=2) + "\n")
+        card = regmean_model_card(
             output.name, UPSTREAM.get(config.get("model_type", "")), report
         )
     else:
@@ -267,6 +290,44 @@ multilingual VoiceChat model. It contains no RNN-T decoder/joint or language
 prompt projector, and retrieval metrics are screening evidence rather than an
 ASR or VoiceChat deployment evaluation. No final lambda was selected in this
 comparison.
+"""
+
+
+def regmean_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:
+    """Describe a Comparison 6 artifact: a closed-form merge, nothing trained."""
+
+    origin = (
+        f"[`{upstream}`](https://huggingface.co/{upstream})" if upstream
+        else "the pinned PT_ML streaming ASR checkpoint"
+    )
+    return f"""# {name}
+
+Comparison 6 (closed-form merging) for the multilingual VoiceChat
+encoder-transfer experiment. Starting from {origin}, every dense linear was
+solved as `{report.get('method', 'regmean++')}` at shrinkage
+`alpha = {report.get('alpha', '?')}` against Gram matrices collected separately
+per candidate -- English assistant audio for `FT_EN`, fr/de/ru for `PT_ML` --
+and every remaining tensor was simple-averaged.
+
+## What was and was not fitted
+
+There is no gradient descent anywhere in this artifact. Each layer is one
+symmetric solve, and the only passes over audio are forward passes. The
+projection and mel-featurizer tensors are exact copies of the pinned
+VoiceChat/`FT_EN` source, unchanged, and the complete runtime configuration --
+including the 56-frame left context -- comes from `PT_ML`.
+`regmean_merge.json` records the tensor routing, the Gram budget, the per-layer
+solves and the frozen setup.
+
+## Limits
+
+Each layer is solved greedily against its own inputs and nothing controls error
+at the encoder *output*, which is the only quantity the frozen language model
+reads: per-layer residuals in the report are not evidence of success. This is a
+research candidate, not evidence of a deployable multilingual VoiceChat model.
+It contains no RNN-T decoder/joint or language-prompt projector, and retrieval
+metrics are screening evidence rather than an ASR or VoiceChat deployment
+evaluation.
 """
 
 
