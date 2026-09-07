@@ -62,7 +62,7 @@ manifest and in `experiment.json`, as two conditions rather than a column.
 | Stage | State |
 |---|---|
 | `prepare` | frozen, reproducible |
-| `cache` (frozen encoder outputs) | E1 frozen: 7,043 clips, 1.4 GB, encoder digest `5c2e4dd7…`. E2/E3/E4 running |
+| `cache` (frozen encoder outputs) | **all four arms frozen**, 7,043 clips and 1.4 GB each |
 | `targets-text` (B2) | running, ~5.7 clips/min over 5,010 clips under both prompts |
 | `targets-audio` (B1) | not started — needs the runtime container on the **original** perception mmproj |
 | `freeze-targets` | blocked on both target pools |
@@ -71,11 +71,51 @@ manifest and in `experiment.json`, as two conditions rather than a column.
 | `export` | implemented this session; blocked on a fit |
 | shared evaluation, MASSIVE `test` scoring, quantization, speech-to-action | not started |
 
+The frozen encoder outputs, one cache per arm over the same 7,043 clips:
+
+| Arm | encoder digest |
+|---|---|
+| E1 | `5c2e4dd741de22fb…` |
+| E2 | `a5a4be667b089003…` |
+| E3 | `7c8e188db0d0524d…` |
+| E4 | `ba705d67d77d9fc3…` |
+
 The B2 teacher decodes greedily (`temperature: 0`) against a stock llama.cpp
 server on the Q8_0 STT LM, one request at a time, resuming per clip and prompt
 from content-addressed files. A spot check of the first clips shows prompt A
 answering in English and prompt B in German on the same German command, both
 passing the frozen output-language gate.
+
+## The fitting loop, measured
+
+`fit` cannot run until both teacher pools are frozen, but its inner loop can be
+exercised on what already exists: real E1 cached activations, real B2 targets,
+the real projection read out of the VoiceChat checkpoint, the real frozen LM in
+NF4, and the real cached prompt prefixes. Over six German clips:
+
+- token cross-entropy **0.60–1.14 nats**, all finite;
+- gradient norm at the projection **2.0–4.8**, all finite, so supervision does
+  reach the 4,592,000 trainable parameters through the checkpointed Mamba2 and
+  attention backward;
+- `assert_frozen()` holds afterwards — no language-model parameter carries a
+  gradient;
+- **peak 7.96 GiB** allocated (8.68 GiB reserved), against §10's ~8 GB NF4
+  estimate;
+- **~0.55 s per example** forward and backward, after a 65 s model load.
+
+That last number is the one that decides the plan's feasibility. At two epochs
+over the 100% budget, both prompt conditions and the teacher-gate retention,
+one arm's largest fit is roughly three hours, so all twelve fits — four arms at
+25/50/100% — are on the order of a day of GPU, which is what §10 predicted.
+This measures the loop, not any arm: no projection was updated and nothing here
+is a result.
+
+Partial teacher quality, over the 408 German clips generated under both prompts
+so far: prompt A usable on 83%, prompt B on 90%, consistent with the §11 gate's
+0–16% and 10–18% costs. **The paired retention rule compounds them**: requiring
+both conditions to pass keeps 76% of clips, so Dataset B's effective size at
+100% is well below its clip count. Worth reading again over fr and ru before
+concluding anything about budget.
 
 ## Fixed this session
 
@@ -133,15 +173,29 @@ passing the frozen output-language gate.
 
 ## Open items the next session should not rediscover
 
-- **The GPU is oversubscribed.** A Comparison 6 deployment container
-  (`mmproj-asr-regmean-plus-plus-Q8_0.gguf`) has held 14.6 GB since that
-  comparison finished, and the B2 text teacher holds 6 GB. The encoder caches
-  fit in what is left, but §10 budgets ~8 GB for NF4 fitting, so **both must be
-  stopped before the first `fit`**, and B1 target generation needs the
-  container restarted on `mmproj-voicechat-perception-Q8_0.gguf` anyway.
+- **The leftover Comparison 6 container was stopped, and is not running.** It
+  had held 14.6 GB since that comparison finished 21 hours earlier, which was
+  enough to make the fitting backward fail in `cublasCreate`; the loop only
+  measured after it was stopped. Nothing else was changed and it restores with
+
+  ```bash
+  ASR_MODEL=regmean-plus-plus docker compose \
+    --env-file .cache/experiments/voice-assistant-pilot-v2/runtime.env \
+    -f /tmp/nemotron-voicechat-main-229dc0e/docker-compose.yml up -d voicechat
+  ```
+
+  B1 target generation needs it back with `ASR_MODEL` naming the **original**
+  perception encoder rather than a candidate.
+- **B1 and B2 cannot share the card.** B1 runs `voicechat-cli` by `docker exec`
+  inside a container whose own bridge server already holds ~14.6 GB, and the
+  B2 text teacher holds 6 GB, so the three do not fit in 24 GB together. Run
+  the pools one after the other, and stop the text teacher before fitting.
 - **B1 is the long pole, not B2.** 2,033 clips under two prompts is 4,066
   runtime turns, each streaming its audio and then decoding, against B2's
-  ~14 hours. Budget for it before starting.
+  ~14 hours. Budget for it before starting. Its `VC_DUMP=1` frame trace, which
+  `parse_audio_trace` needs and which `asr_align/gating.py` injects, is present
+  in the pinned runtime (`voicechat-cli.cpp` emits the `DUMP t=… txt=… fn=…`
+  line the parser matches), so the path is supported but unexercised.
 - **The precision variable is unmeasured.** Every fit records its
   language-model precision, but the NF4-versus-bf16 gap invariant 3 asks for
   has not been run.
