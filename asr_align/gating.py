@@ -507,6 +507,7 @@ class PerceptionPathEngine:
         session_seconds: float = 60.0,
         ready_timeout: float = 900.0,
         turn_timeout: float = 600.0,
+        trace_path: Path | None = None,
     ):
         self.arguments = [
             "docker", "exec", "-i", container,
@@ -523,11 +524,16 @@ class PerceptionPathEngine:
         self.silence = silence
         self.turn_timeout = turn_timeout
         self.errors: list[dict[str, Any]] = []
+        self.trace = None
+        if trace_path is not None:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            self.trace = trace_path.open("w", encoding="utf-8")
+            self.arguments[2:2] = ["-e", "VC_DUMP=1"]
         self.process = subprocess.Popen(
             self.arguments,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self.trace if self.trace is not None else subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             bufsize=1,
@@ -587,6 +593,9 @@ class PerceptionPathEngine:
             self.process.wait(timeout=120)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            self.process.wait()
+        if self.trace is not None:
+            self.trace.close()
 
 
 class TextPathEngine:

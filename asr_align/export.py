@@ -42,6 +42,7 @@ _BASELINE = "baseline.json"
 _DIRECT = "direct_task_arithmetic.json"
 _FINAL_MAP = "final_activation_map.json"
 _REGMEAN = "regmean_merge.json"
+_INTERFACE_FIT = "interface_fit.json"
 
 # The published repo each config belongs to. The local directory name is not it
 # -- download.sh chooses that -- and a model card gets read by someone who wants
@@ -177,6 +178,23 @@ def export(
                 "regmean_merge.json."
             ),
         }
+    elif artifact_kind == "gradient_fitted_interface":
+        config["voicechat_interface_fit"] = {
+            "comparison": 7,
+            "arm": report.get("arm"),
+            "data_budget_percent": report.get("data_budget_percent"),
+            "fitting_precision": report.get("fitting_precision"),
+            "projection_dim": int(proj_weight.shape[0]),
+            "alignment_map": None,
+            "note": (
+                "encoder.* is byte-identical to this arm's source. Only proj.* was "
+                "trained, by token cross-entropy through the frozen VoiceChat "
+                "language model over both frozen output-language prompts; nothing "
+                "else in the served graph was touched. The featurizer is an exact "
+                "copy of the FT_EN VoiceChat source and the complete runtime "
+                "configuration comes from PT_ML. See interface_fit.json."
+            ),
+        }
     else:
         config["voicechat_alignment"] = {
             "map": report.get("map"),
@@ -215,10 +233,61 @@ def export(
         card = regmean_model_card(
             output.name, UPSTREAM.get(config.get("model_type", "")), report
         )
+    elif artifact_kind == "gradient_fitted_interface":
+        (output / _INTERFACE_FIT).write_text(json.dumps(report, indent=2) + "\n")
+        card = interface_fit_model_card(
+            output.name, UPSTREAM.get(config.get("model_type", "")), report
+        )
     else:
         (output / _ALIGNMENT).write_text(json.dumps(report, indent=2) + "\n")
         card = model_card(output.name, UPSTREAM.get(config.get("model_type", "")), report)
     (output / "README.md").write_text(card)
+
+
+def interface_fit_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:
+    """Describe a Comparison 7 artifact: a trained interface, a frozen encoder."""
+
+    origin = (
+        f"[`{upstream}`](https://huggingface.co/{upstream})" if upstream
+        else "the pinned streaming ASR checkpoint"
+    )
+    definition = report.get("arm_definition") or {}
+    return f"""# {name}
+
+Comparison 7 (end-to-end interface fitting) for the multilingual VoiceChat
+encoder-transfer experiment. The encoder is
+`{definition.get('encoder', '?')}`, byte-identical to its source: `encoder.*`
+was copied from it and nothing was added, subtracted, or fused. The upstream
+configuration is {origin}'s, per the experiment's runtime-inheritance rule.
+
+## What was changed
+
+Only `proj.*`, arm `{report.get('arm', '?')}`. The 1024 -> 4480 projection was
+initialized at `{definition.get('initialization', '?')}` and trained by token
+cross-entropy through the **frozen** VoiceChat language model, at
+{report.get('data_budget_percent', '?')}% of the frozen Dataset B, under both
+output-language system prompts at once. No language-model parameter was
+trained, and no other tensor in the served graph was touched.
+
+The language-model precision used for fitting was
+`{report.get('fitting_precision', '?')}`, which is an experimental variable
+here rather than only an export stage: deployment runs Q8_0, so a projection
+fitted against a quantized model partly absorbs that model's error.
+`interface_fit.json` records it alongside the initialization, the frozen
+training manifest, the frozen system prompts, the teacher path each target was
+generated through, and the fit's own settings and result.
+
+## Limits
+
+This artifact is a research candidate, not evidence of a deployable
+multilingual VoiceChat model. Its foreign-language supervision came from a
+multilingual language model reading native text, so some apparent multilingual
+ability may belong to that model's priors rather than to the encoder conveying
+foreign phonetics: arm E1 exists to bound exactly that, and the two arms are
+only comparable at a matched data budget. It contains no RNN-T decoder/joint or
+language prompt projector, and retrieval metrics are screening evidence rather
+than an ASR or VoiceChat deployment evaluation.
+"""
 
 
 def final_map_model_card(name: str, upstream: str | None, report: dict[str, Any]) -> str:

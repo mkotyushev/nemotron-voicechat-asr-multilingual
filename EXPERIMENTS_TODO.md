@@ -401,6 +401,9 @@ commands, hashes, metrics and limits.
 Fit `proj` by token cross-entropy through the frozen VoiceChat language model,
 and use it to ablate whether the merge of comparison 6 was needed at all.
 
+`COMPARISON_7_RUN_LOG.md` tracks this comparison while it runs: what is frozen,
+what each stage has produced, and how to resume. It records no result.
+
 Invariant 6 authorises a gradient-fitted projection for this comparison, and
 invariant 3 requires the fitting precision to be recorded. Every arm below must
 carry the provenance those invariants name.
@@ -421,19 +424,32 @@ to generate targets.
 - [ ] Record the teacher path in each candidate's provenance alongside the
   initialization, training manifest, frozen system prompt and fitting precision
   invariant 6 requires. Generate B2 targets through the chat format.
-- [ ] Freeze two system prompts as separate conditions: **A** "reply in English
+- [x] Freeze two system prompts as separate conditions: **A** "reply in English
   only" and **B** "reply in the input language". Under invariant 9 these are two
-  comparison rows, not one row with a prompt column.
-- [ ] Build Dataset B on clips disjoint from Dataset A:
+  comparison rows, not one row with a prompt column. Both are frozen in
+  `gating.SYSTEM_PROMPTS` and pinned identically into the Dataset B manifest and
+  `experiment.json`; keeping them two rows is an evaluation-time obligation that
+  `build_comparison()` still has to enforce.
+- [x] Build Dataset B on clips disjoint from Dataset A:
   - **B1**, SLURP `val` audio, target = what the original VoiceChat emits on the
     same clip. The original `proj` reaches zero loss on B1 by construction.
   - **B2**, Speech-MASSIVE `dev` remainder, target = the frozen LM run text-only
     on the **native-language** transcript under the condition's prompt.
+
+  Frozen as `dataset-b-v1/dataset_b.json` (`f8595541…`): 7,043 whole recordings
+  / 7.2 hours, 1,830+203 B1 English and 1,503+167 B2 per foreign language.
+  Checked independently of the builder: no utterance is shared with either
+  Dataset A pool or with the §11 gating sample, none crosses the
+  train/validation boundary in any locale, only SLURP `devel` and
+  Speech-MASSIVE `dev` are touched, and the 25/50/100% draws are nested.
 - [ ] Generate B2 targets from the target-language MASSIVE text, never from
   `en-US`. MASSIVE localized rather than translated, so an `en-US`-derived
   target names entities the foreign audio never contained.
-- [ ] Record MASSIVE's per-slot replacement method per utterance; it identifies
-  where the two output conditions are most likely to diverge.
+- [x] Record MASSIVE's per-slot replacement method per utterance; it identifies
+  where the two output conditions are most likely to diverge. Carried per row in
+  the frozen manifest and required by `validate_manifest`: 3,393 of 5,010 B2
+  rows have at least one annotation, over `translation`, `localization`,
+  `unchanged` and `unchanged_translation`.
 - [x] Measure the text-path versus audio-path target gap on a small English
   subset, so B1 and B2 losses are on a comparable scale. Measured on 24 English
   BFCL clips disjoint from the frozen pilot: median unigram F1 0.41 against the

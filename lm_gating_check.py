@@ -108,7 +108,7 @@ def _container_provenance(container: str, model: str, mmproj: str) -> dict[str, 
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     digests = subprocess.run(
-        ["docker", "exec", container, "sh", "-c", f"sha256sum {model} {mmproj} /app/llama-voicechat"],
+        ["docker", "exec", container, "sha256sum", model, mmproj, "/app/llama-voicechat"],
         check=True, capture_output=True, text=True,
     ).stdout.strip().splitlines()
     return {
