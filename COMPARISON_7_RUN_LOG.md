@@ -64,11 +64,11 @@ manifest and in `experiment.json`, as two conditions rather than a column.
 | `prepare` | frozen, reproducible |
 | `cache` (frozen encoder outputs) | **all four arms frozen**, 7,043 clips and 1.4 GB each |
 | `targets-text` (B2) | running, ~5.7 clips/min over 5,010 clips under both prompts |
-| `targets-audio` (B1) | not started — needs the runtime container on the **original** perception mmproj |
+| `targets-audio` (B1) | path exercised on 24 clips in scratch; the real pool is not started |
 | `freeze-targets` | blocked on both target pools |
 | `fit` | blocked on targets; E1 must run first |
 | `gate` | implemented this session; blocked on E1's fit |
-| `export` | implemented this session; blocked on a fit |
+| `export` | implemented **and exercised** on a scratch E1 fit; blocked on a real one |
 | shared evaluation, MASSIVE `test` scoring, quantization, speech-to-action | not started |
 
 The frozen encoder outputs, one cache per arm over the same 7,043 clips:
@@ -110,12 +110,50 @@ one arm's largest fit is roughly three hours, so all twelve fits — four arms a
 This measures the loop, not any arm: no projection was updated and nothing here
 is a result.
 
+`export` was exercised the same way, on a scratch fit whose "trained"
+projection is the original VoiceChat one. The artifact it wrote carries
+`voicechat_interface_fit` rather than the generic alignment fallback, its
+`encoder.*` is byte-identical to E1's source (`5c2e4dd7…`, 636 tensors,
+609,141,760 values), its four interface tensors match the fit exactly, and the
+exported `proj.weight` is bit-identical to the projection that went in.
+
 Partial teacher quality, over the 408 German clips generated under both prompts
 so far: prompt A usable on 83%, prompt B on 90%, consistent with the §11 gate's
 0–16% and 10–18% costs. **The paired retention rule compounds them**: requiring
 both conditions to pass keeps 76% of clips, so Dataset B's effective size at
 100% is well below its clip count. Worth reading again over fr and ru before
 concluding anything about budget.
+
+## The B1 audio teacher, exercised
+
+Run on 24 SLURP clips under both prompts into a scratch directory, so nothing
+in the real experiment was frozen at settings that might still change:
+
+- the `VC_DUMP=1` frame trace parses into a per-frame timeline — median 79
+  frames, the prefix length derived from the tokenized system prompt matching
+  the runtime's first traced frame exactly (26 under prompt A, 29 under B);
+- **83% of clips are retained** under the paired rule, prompt A usable on 83%
+  and prompt B on 88%;
+- **median 16.6 s per turn** (max 29.7), so the full pool of 2,033 clips under
+  two prompts is on the order of **19 hours** — the longest single stage in the
+  comparison, and it cannot share the card with the B2 text teacher.
+
+One thing to decide before the full run rather than after it. Two of the 48
+traces were rejected as "spontaneous function activity", and in both the cause
+is a **single frame** where the function head emitted a subword echoing the
+text channel — at `t=65` the text channel emits `'uff'` and the function
+channel `'uffle'`, inside the word "truffle". That is not a tool call the
+student would have to reproduce; it looks like the function head's ordinary
+output on a non-tool turn. The guard is doing what it says, and it was left
+exactly as written, but at 4% of traces it is worth asking whether a whole clip
+should be dropped for one such frame, or whether the rule should be about the
+function channel actually opening a call. Changing it is a supervision change
+and belongs in the design record, not in a runner.
+
+The teacher also mishears: on SLURP 10017 the original VoiceChat answers about
+poaching truffles. That is not a defect here — B1's target is by definition
+what the original model emits on the clip — but it is worth remembering when
+reading B1 losses, which are distillation distances and not correctness.
 
 ## Fixed this session
 
