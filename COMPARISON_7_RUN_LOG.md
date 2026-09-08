@@ -63,9 +63,9 @@ manifest and in `experiment.json`, as two conditions rather than a column.
 |---|---|
 | `prepare` | frozen, reproducible |
 | `cache` (frozen encoder outputs) | **all four arms frozen**, 7,043 clips and 1.4 GB each |
-| `targets-text` (B2) | running, ~5.7 clips/min over 5,010 clips under both prompts |
-| `targets-audio` (B1) | path exercised on 24 clips in scratch; the real pool is not started |
-| `freeze-targets` | blocked on both target pools |
+| `targets-text` (B2) | **complete**: 10,020 targets, all present and digest-valid |
+| `targets-audio` (B1) | running, ~17 s/turn over 4,066 turns |
+| `freeze-targets` | blocked on B1 |
 | `fit` | blocked on targets; E1 must run first |
 | `gate` | implemented this session; blocked on E1's fit |
 | `export` | implemented **and exercised** on a scratch E1 fit; blocked on a real one |
@@ -117,12 +117,28 @@ projection is the original VoiceChat one. The artifact it wrote carries
 609,141,760 values), its four interface tensors match the fit exactly, and the
 exported `proj.weight` is bit-identical to the projection that went in.
 
-Partial teacher quality, over the 408 German clips generated under both prompts
-so far: prompt A usable on 83%, prompt B on 90%, consistent with the §11 gate's
-0–16% and 10–18% costs. **The paired retention rule compounds them**: requiring
-both conditions to pass keeps 76% of clips, so Dataset B's effective size at
-100% is well below its clip count. Worth reading again over fr and ru before
-concluding anything about budget.
+## B2 teacher quality, complete
+
+All 10,020 targets are written and digest-valid, none missing or truncated, and
+the run logged no error. Usable rate per cell:
+
+| | de | fr | ru |
+|---|---:|---:|---:|
+| prompt A, English only | 0.87 | 0.90 | **0.99** |
+| prompt B, input language | 0.88 | 0.87 | 0.86 |
+
+Russian's 0.99 under prompt A is the §11 gate showing through rather than a
+surprise: that check found the model answering in the input language on 15% of
+German and 9% of French utterances under prompt A, and Russian is the language
+it is least willing to answer in, so almost nothing is discarded for replying in
+the wrong one. Read together with prompt B, where ru is the weakest cell at
+0.86, the two conditions are gated by opposite failures.
+
+**The paired retention rule costs more than either rate suggests**: requiring
+both conditions to pass keeps **81%** of B2 clips (4,039 of 5,010) — 0.78 de,
+0.80 fr, 0.85 ru on train — so Dataset B's effective size is well below its clip
+count and the 25/50/100% budgets are drawn before this gate, not after. No
+language or split cell is empty, so `freeze-targets` will not trip on B2.
 
 ## The B1 audio teacher, exercised
 
@@ -138,17 +154,23 @@ in the real experiment was frozen at settings that might still change:
   two prompts is on the order of **19 hours** — the longest single stage in the
   comparison, and it cannot share the card with the B2 text teacher.
 
-One thing to decide before the full run rather than after it. Two of the 48
-traces were rejected as "spontaneous function activity", and in both the cause
-is a **single frame** where the function head emitted a subword echoing the
-text channel — at `t=65` the text channel emits `'uff'` and the function
-channel `'uffle'`, inside the word "truffle". That is not a tool call the
-student would have to reproduce; it looks like the function head's ordinary
-output on a non-tool turn. The guard is doing what it says, and it was left
-exactly as written, but at 4% of traces it is worth asking whether a whole clip
-should be dropped for one such frame, or whether the rule should be about the
-function channel actually opening a call. Changing it is a supervision change
-and belongs in the design record, not in a runner.
+Two of the 48 traces were rejected as "spontaneous function activity", and in
+both the cause is a **single frame** where the function head emitted a subword
+echoing the text channel — at `t=65` the text channel emits `'uff'` and the
+function channel `'uffle'`, inside the word "truffle". That is not a tool call
+the student would have to reproduce; it looks like the function head's ordinary
+output on a non-tool turn. At 4% of traces it is worth asking whether a whole
+clip should be dropped for one such frame, or whether the rule should be about
+the function channel actually opening a call.
+
+**This was put to the decision and the guard was kept as written**, so the full
+run supervises only turns with a clean function channel and pays about 4% of
+B1 for it. It is a decision rather than an oversight: `usable` and `timeline`
+are frozen per target file at generation time and `write_frozen` will not
+replace them, so revisiting the rule later means regenerating B1 into a new
+directory — the stored `runtime_trace` makes a re-parse possible in principle,
+but not in place. If it is ever revisited, it is a supervision change and
+belongs in the design record.
 
 The teacher also mishears: on SLURP 10017 the original VoiceChat answers about
 poaching truffles. That is not a defect here — B1's target is by definition
@@ -211,19 +233,24 @@ reading B1 losses, which are distillation distances and not correctness.
 
 ## Open items the next session should not rediscover
 
-- **The leftover Comparison 6 container was stopped, and is not running.** It
-  had held 14.6 GB since that comparison finished 21 hours earlier, which was
-  enough to make the fitting backward fail in `cublasCreate`; the loop only
-  measured after it was stopped. Nothing else was changed and it restores with
+- **The container is now up on the original perception encoder**
+  (`ASR_MODEL=container`), because B1 is running against it, and the B2 text
+  teacher is stopped. Before the first `fit`, stop the container again: §10
+  budgets ~8 GB for NF4 and the container alone holds 14.6 GB.
+- **It was previously serving Comparison 6's merge**, and had held 14.6 GB
+  since that comparison finished 21 hours earlier — enough to make the fitting
+  backward fail in `cublasCreate`, so the loop could only be measured after it
+  was stopped. `ASR_MODEL` selects only what the container's own bridge server
+  loads; B1 execs its own `voicechat-cli` with an explicit `--mmproj`, so the
+  bridge is dead weight during target generation. Either encoder is one command:
 
   ```bash
-  ASR_MODEL=regmean-plus-plus docker compose \
+  ASR_MODEL=container docker compose \
     --env-file .cache/experiments/voice-assistant-pilot-v2/runtime.env \
     -f /tmp/nemotron-voicechat-main-229dc0e/docker-compose.yml up -d voicechat
   ```
 
-  B1 target generation needs it back with `ASR_MODEL` naming the **original**
-  perception encoder rather than a candidate.
+  `ASR_MODEL=regmean-plus-plus` restores the Comparison 6 state it was found in.
 - **B1 and B2 cannot share the card.** B1 runs `voicechat-cli` by `docker exec`
   inside a container whose own bridge server already holds ~14.6 GB, and the
   B2 text teacher holds 6 GB, so the three do not fit in 24 GB together. Run
