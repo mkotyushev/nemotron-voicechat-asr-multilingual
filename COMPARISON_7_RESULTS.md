@@ -513,6 +513,23 @@ cleanup of slightly noisy labels — the v1 targets were *a different target*.
 Roughly four fifths of the pool would have taught the student a reply the
 teacher does not give on the path deployment runs.
 
+### The gate's control works, checked before the refit was started
+
+Cheap to run and expensive to get wrong, so it was run first: FT_EN's own
+untouched projection, free running on held-out English under all three
+deployment conditions, opened **12 of 12** turns with fluent on-topic replies
+at onsets of −5 to +4 frames, median +3 — against the duplex teacher's own
+median of +4.
+
+That validates the whole chain end to end rather than the harness alone. The
+model produces coherent speech while its audio channel is indexing the cache's
+encoded silence, which is the supervision the refit consumes; the frame
+alignment at offset 1 puts the command where the model expects it; and the
+control is calibrated, so `duplex_gate_verdict` can tell a silent fit from a
+sound one instead of returning a meaningless pass. Free running costs about
+4.7 s an example, so the full gate over 303 held-out targets under two
+projections is roughly 45 minutes.
+
 ## Two preconditions the refit had beyond the teacher, both now met
 
 Regenerating B1 fixed the supervision but not the graph that consumes it.
