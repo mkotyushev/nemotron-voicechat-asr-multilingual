@@ -470,18 +470,31 @@ retention summary. The generator is
 `.cache/experiments/comparison-7-duplex-subset-check.py`. These are subset
 checks sizing the full run; no fit may consume them.
 
-## Two preconditions the refit still has, beyond the teacher
+## Two preconditions the refit had beyond the teacher, both now met
 
-Regenerating B1 fixes the supervision but not the graph that consumes it.
+Regenerating B1 fixed the supervision but not the graph that consumes it.
+Both of these are implemented and unit tested; neither has run on the GPU yet.
 
-1. **The training graph still feeds an exact zero audio tail.**
-   `interface_fit.duplex_inputs` computes
+1. **The training graph fed an exact zero audio tail.**
+   `interface_fit.duplex_inputs` computed
    `projected[indices.clamp_min(0)] * (indices >= 0)`, so every post-command
-   frame is a zero vector. A duplex teacher hears *encoded silence* there, and
-   so does deployment. Left unchanged, the refit would present zeros where its
-   own teacher heard silence — the same train/serve gap with better labels. The
-   encoder cache needs a silence tail per clip and the timeline must index into
-   it instead of zeroing. This is a code change and a cache regeneration.
+   frame was a zero vector. A duplex teacher hears *encoded silence* there, and
+   so does deployment. Left unchanged, the refit would have presented zeros
+   where its own teacher heard silence — the same train/serve gap with better
+   labels.
+
+   The new `cache-duplex` stage re-runs each clip's encoder over the waveform
+   the bridge actually streams — lead silence, the command zero padded to a
+   whole 80 ms block, then a silence tail — and both timelines index it as a
+   contiguous window. `duplex_inputs` now **rejects** a timeline containing a
+   `-1` rather than zeroing it, so v1 supervision is not fittable by accident.
+   The tail is 213 frames, taken from the pools themselves: B1's timelines
+   reach 150 and B2's longest reply needs 213. There is no per-clip trimming
+   and no shared steady-state frame, because silence embeddings do not
+   converge — still ~0.6 from the steady state at k=128, and cosine 0.85–0.995
+   between clips — so a shared tail would be a different tail. That costs
+   7.7 GB an arm, which is why the tensors live on `/srv/bulk` while the
+   sidecars and index stay with the experiment and are still hashed.
 2. **The gate must run free, on the deployment tail, and score onset.** A
    free-running check alone would not have caught v1: with the training-time
    zero tail both projections answered 48/48. It has to reproduce all three
@@ -489,6 +502,15 @@ Regenerating B1 fixes the supervision but not the graph that consumes it.
    encoded-silence tail — and record whether the turn opened and how many frames
    past the command, not merely whether tokens appeared. The untouched FT_EN
    projection is the negative control and passes at 24/24.
+
+   `interface_fit.duplex_free_run` reproduces all three and reports the onset;
+   `duplex_gate_verdict` fails the fit if its open rate falls more than five
+   points below the untouched projection's in any prompt cell, and fails the
+   *whole gate* if that control does not itself open every held-out turn —
+   an uncalibrated harness must not be able to return a pass. `english_gate`
+   now runs both and requires both. A turn that has not opened 50 frames past
+   the command stops there rather than decoding the remaining ~200 frames of
+   silence, since on this gate the silent runs are the common case.
 
 ## What has to be decided before any arm is refit
 
