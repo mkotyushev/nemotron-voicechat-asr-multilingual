@@ -43,8 +43,10 @@ from __future__ import annotations
 
 import json
 import math
+import queue
 import re
 import subprocess
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -644,10 +646,14 @@ class DuplexPerceptionEngine:
         ]
         self.frame_timeout = frame_timeout
         self.errors: list[dict[str, Any]] = []
+        self.tool_calls: list[dict[str, Any]] = []
         self.trace = None
         if trace_path is not None:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
-            self.trace = trace_path.open("w", encoding="utf-8")
+            # Append: a resumed stage must not truncate the audit log of the
+            # turns already recorded.  Slices are taken by current byte offset,
+            # so appending is what the offsets already assume.
+            self.trace = trace_path.open("a", encoding="utf-8")
             self.arguments[2:2] = ["-e", "VC_DUMP=1"]
         self.process = subprocess.Popen(
             self.arguments,
@@ -658,7 +664,22 @@ class DuplexPerceptionEngine:
             encoding="utf-8",
             bufsize=1,
         )
+        # `readline` on a buffered text stream cannot be given a deadline, and
+        # `select` on the file descriptor would miss a line already sitting in
+        # Python's own buffer, so the reader gets a thread and `_await` waits
+        # on a queue.  Without this a runtime that stops emitting hangs the
+        # stage forever rather than failing: the timeout below is only checked
+        # between lines.
+        self._lines: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
         self._await("ready", ready_timeout)
+
+    def _pump(self) -> None:
+        assert self.process.stdout is not None
+        for line in self.process.stdout:
+            self._lines.put(line)
+        self._lines.put(None)
 
     def _send(self, command: Mapping[str, Any]) -> None:
         assert self.process.stdin is not None
@@ -666,11 +687,17 @@ class DuplexPerceptionEngine:
         self.process.stdin.flush()
 
     def _await(self, kind: str, timeout: float, collect: list | None = None) -> dict[str, Any]:
-        assert self.process.stdout is not None
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            line = self.process.stdout.readline()
-            if not line:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ExperimentValidationError(f"timed out waiting for {kind!r} from the voicechat CLI")
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                raise ExperimentValidationError(
+                    f"timed out waiting for {kind!r} from the voicechat CLI") from None
+            if line is None:
                 raise ExperimentValidationError(
                     f"the voicechat CLI exited before emitting {kind!r}"
                 )
@@ -681,11 +708,20 @@ class DuplexPerceptionEngine:
             if event.get("kind") == "error":
                 self.errors.append(dict(event))
                 continue
+            # The model may answer with a tool call rather than speech.  The
+            # runtime then blocks its serve loop until the client responds, and
+            # a client that only waits for `response_end` deadlocks -- which is
+            # what stopped the first full run 17 clips from the end.  We do not
+            # supervise tool calls, so release the loop the way the Realtime
+            # bridge's `_skip_tool_call` does and record that it happened.
+            if event.get("kind") == "tool_call":
+                self.tool_calls.append(dict(event))
+                self._send({"cmd": "tool_skip"})
+                continue
             if collect is not None:
                 collect.append(event)
             if event.get("kind") == kind:
                 return event
-        raise ExperimentValidationError(f"timed out waiting for {kind!r} from the voicechat CLI")
 
     def generate(self, prompt: str, samples, *, lead_frames: int = 8,
                  tail_frames: int = 150) -> dict[str, Any]:
@@ -693,7 +729,7 @@ class DuplexPerceptionEngine:
 
         import numpy
 
-        before = len(self.errors)
+        before, tools_before = len(self.errors), len(self.tool_calls)
         started = time.monotonic()
         self._send({"cmd": "reset"})
         self._await("reset", self.frame_timeout)
@@ -753,6 +789,7 @@ class DuplexPerceptionEngine:
             "frames": None if response_end is None else response_end.get("frames"),
             "seconds": round(time.monotonic() - started, 3),
             "errors": self.errors[before:],
+            "tool_calls": self.tool_calls[tools_before:],
         }
 
     def close(self) -> None:

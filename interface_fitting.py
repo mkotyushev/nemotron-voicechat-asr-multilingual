@@ -485,10 +485,13 @@ def target_audio_duplex(args):
     write_frozen(output / "language_identifier.json", quality)
     trace = output / "runtime-trace.log"
 
-    engine = gating.DuplexPerceptionEngine(
-        container=args.container, model=args.teacher_model, mmproj=args.teacher_mmproj,
-        n_gpu_layers=args.n_gpu_layers, extra_decoding_seconds=args.extra_decoding_seconds,
-        session_seconds=args.session_seconds, trace_path=trace)
+    def start_engine():
+        return gating.DuplexPerceptionEngine(
+            container=args.container, model=args.teacher_model, mmproj=args.teacher_mmproj,
+            n_gpu_layers=args.n_gpu_layers, extra_decoding_seconds=args.extra_decoding_seconds,
+            session_seconds=args.session_seconds, trace_path=trace)
+
+    engine = start_engine()
     try:
         rows = [r for group in data["splits"].values() for r in group if r["pool"] == "B1"]
         if args.limit:
@@ -506,8 +509,20 @@ def target_audio_duplex(args):
                         raise ExperimentValidationError("B1 duplex target teacher provenance changed")
                     continue
                 offset = trace.stat().st_size
-                reply = engine.generate(system, samples, lead_frames=args.lead_frames,
-                                        tail_frames=args.tail_frames)
+                try:
+                    reply = engine.generate(system, samples, lead_frames=args.lead_frames,
+                                            tail_frames=args.tail_frames)
+                except ExperimentValidationError as exc:
+                    # One clip must not cost the run. The stage is resumable,
+                    # but a teacher that has stopped answering will fail every
+                    # remaining clip, so give it a fresh process once.
+                    LOG.warning("%s/%s: restarting the teacher after %s",
+                                row["clip_id"], condition, exc)
+                    engine.close()
+                    engine = start_engine()
+                    offset = trace.stat().st_size
+                    reply = engine.generate(system, samples, lead_frames=args.lead_frames,
+                                            tail_frames=args.tail_frames)
                 with trace.open("rb") as stream:
                     stream.seek(offset)
                     traced = stream.read().decode("utf-8", errors="replace")
@@ -528,6 +543,12 @@ def target_audio_duplex(args):
                                                     spoken=reply["spoken"])
                 if reply.get("errors"):
                     rejections.append("runtime error")
+                # Answering with a tool call is real FT_EN behaviour, and like
+                # barge-in it stays in the frozen LM: there is no spoken reply
+                # to supervise, and the timeline behind it is a function-channel
+                # trace rather than speech.
+                if reply.get("tool_calls"):
+                    rejections.append("answered with a tool call")
                 if not scored["usable"]:
                     rejections.append("reply not usable")
                 if scored["identified_language"] != "en":
