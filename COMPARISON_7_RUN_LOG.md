@@ -406,6 +406,25 @@ event back -- not because the card is saturated. Pipelining the command frames
 might recover 10-15%, but writing many frames without draining stdout risks a
 pipe deadlock, which is a poor trade against a run of this length.
 
+## The encoder cache cannot share the machine with the teacher
+
+Tried, measured, backed out. `cache-duplex` was started alongside the running
+B1 teacher on the reasoning that the card had 12.2 GB free and sat at 36%
+utilisation. Six minutes later it had written nothing, had not yet put the
+encoder on the GPU, and had taken the teacher from **7.7 to 4.3 clips a
+minute** -- a 44% loss that would push a 3 hour run past 5.
+
+The contention is not the GPU. `arm_weights` sha256s the multi-GB VoiceChat
+checkpoint and then loads it *twice* for E1, since `source` and `original` are
+the same file, so the stage opens with minutes of pure disk I/O against the
+same `/srv/fast` the teacher is reading its clips from, and holds two copies in
+RAM (5.4 GB to 10.5 GB resident, which is also what was tripping the harness's
+low-memory watchdog). Run the two stages one after the other.
+
+Backing out cost nothing, which was the point of trying it: the stage is
+resumable per clip, and it writes its `provenance.json` only after the encoder
+digest it never reached, so no partial artifact was left behind.
+
 ## Open items the next session should not rediscover
 
 - **The runtime has two turn paths and this experiment straddles them.**
