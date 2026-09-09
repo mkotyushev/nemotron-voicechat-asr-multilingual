@@ -332,6 +332,13 @@ class SupervisionTests(unittest.TestCase):
         self.assertFalse(silent["opened"])
         self.assertIsNone(silent["onset_frames_past_command"])
         self.assertEqual(silent["frames_decoded"], 6)
+        # A turn that has not opened within the window the teacher filter would
+        # accept stops there rather than decoding the whole silence tail, which
+        # is what makes the silent runs the expensive ones.
+        capped = interface_fit.duplex_free_run(proj, ScriptedLM([12] * 6), cached, timeline, None,
+                                               command_frames=2, max_onset_frames=1)
+        self.assertFalse(capped["opened"])
+        self.assertEqual(capped["frames_decoded"], 4)
 
     def test_duplex_gate_needs_a_control_that_speaks_and_a_fit_that_still_does(self):
         control = {"A": {"n": 24, "opened": 24, "onsets": [4] * 24},

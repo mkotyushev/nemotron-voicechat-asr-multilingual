@@ -201,7 +201,8 @@ def token_loss(projection: nn.Linear, lm: Any, features: torch.Tensor, timeline:
 @torch.no_grad()
 def duplex_free_run(projection: nn.Linear, lm: Any, features: torch.Tensor,
                     timeline: Mapping[str, Any], prefix, *, command_frames: int,
-                    max_reply_frames: int = 200) -> dict[str, Any]:
+                    max_reply_frames: int = 200,
+                    max_onset_frames: int = DUPLEX_MAX_ONSET_FRAMES) -> dict[str, Any]:
     """Decode the turn with nothing forced, the way `duplex_step` runs it.
 
     `token_loss` is teacher forced: every frame is scored against the teacher's
@@ -238,6 +239,11 @@ def duplex_free_run(projection: nn.Linear, lm: Any, features: torch.Tensor,
         elif opened_at is not None and token == EOS:
             break
         if opened_at is not None and step - opened_at >= max_reply_frames:
+            break
+        # A turn that has not opened this far past the command is one the
+        # teacher filter would have rejected anyway, so decoding the rest of
+        # the silence tail only makes the silent cases the expensive ones.
+        if opened_at is None and step >= command_frames + max_onset_frames:
             break
         previous = token
     spoken = [t for t in tokens[opened_at:] if t not in (PAD, BOS, EOS)] if opened_at is not None else []
