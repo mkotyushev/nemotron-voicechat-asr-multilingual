@@ -406,6 +406,47 @@ event back -- not because the card is saturated. Pipelining the command frames
 might recover 10-15%, but writing many frames without draining stdout risks a
 pipe deadlock, which is a poor trade against a run of this length.
 
+## The teacher can answer with a tool call, and the duplex client must reply
+
+The first full B1 duplex run stopped 17 clips from the end: alive, GPU at 0%,
+no progress for 34 minutes, no error. On clip 2016 the model answered with a
+tool call rather than speech --
+
+```
+frame 194: eotc, duplex tool call:
+  <TOOLCALL>[{"name": "create_appointment", "arguments": {...}}]</TOOLCALL>
+```
+
+-- and the runtime blocks its serve loop until the client sends
+`{"cmd":"tool_response"}` or `{"cmd":"tool_skip"}`. `DuplexPerceptionEngine`
+only ever waited for `response_end`, so both sides waited; Python sat in
+`anon_pipe_read`. The legacy `run_turn` path never meets this because it awaits
+a single `turn_end` that already carries `tool_calls`, which is why the v1 pool
+generated cleanly. It is rare -- 2 turns in 4,066 -- so 4,032 turns passed
+before one appeared.
+
+The engine now releases the loop the way `bridge/engine.py::_skip_tool_call`
+does and the stage rejects that turn: like barge-in, a tool call is FT_EN's own
+behaviour with no spoken reply to supervise.
+
+**The hang should have been a timeout and was not.** `_await` computed an
+absolute deadline but only re-checked it between lines, so a blocking
+`readline()` ignored it entirely. `select` on the descriptor is not the fix
+either: it reports the file descriptor, and would miss a line already sitting
+in Python's buffered text reader. The reader now runs on a daemon thread
+feeding a `queue.Queue` and `_await` waits on the queue, so the timeout is
+real; a turn that does time out restarts the teacher process once rather than
+costing the run.
+
+Two things made the recovery cheap, and both were deliberate. The stage is
+resumable per clip and condition, so only the missing 17 clips were
+regenerated -- three minutes. And none of the fixes touch the frozen teacher
+header, so `write_frozen` accepted the existing `provenance.json` unchanged and
+the 4,032 targets already recorded stayed valid; changing a single string in
+that header would have cost 4.8 GPU-hours. The trace log is now opened for
+append, since a resumed stage had been truncating the audit history of the
+turns it was resuming past.
+
 ## The encoder cache cannot share the machine with the teacher
 
 Tried, measured, backed out. `cache-duplex` was started alongside the running

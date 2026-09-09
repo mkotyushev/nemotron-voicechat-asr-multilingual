@@ -470,6 +470,49 @@ retention summary. The generator is
 `.cache/experiments/comparison-7-duplex-subset-check.py`. These are subset
 checks sizing the full run; no fit may consume them.
 
+## The full duplex pool, generated
+
+2,033 clips under both prompts, 4,066 targets, complete. Generated 2026-09-09
+23:00 to 2026-09-10 03:57 at about 8 clips a minute, against the 17.7 hours the
+v1 pool cost.
+
+| | Duplex, full pool | 48-clip pilot | Frozen B1 (`run_turn`) |
+|---|---:|---:|---:|
+| Per-target retention | 0.764 | 0.854 | 0.94 / 0.95 per prompt |
+| Paired retention | **0.664** (1,350 clips) | 0.833 | 0.93 |
+| Onset past the command, retained | median 4, −4 to +19 | median 4, −4 to +9 | 0 by construction |
+| Frame accounting exact | **4,066 / 4,066** | — | — |
+
+Retention by cell, with no cell close to empty: `train/A` 68.2%, `train/B`
+84.9%, `validation/A` 69.0%, `validation/B` 80.3%. The prompt asymmetry is
+consistent across splits and is barge-in: the English-only prompt draws more of
+it. Budgets survive the filter — the 25% budget keeps 323 of the 457 B1 clips
+it draws, the 50% 619 of 915, the 100% 1,215 of 1,830 — and the held-out split
+keeps 303 paired targets, which is what the gate scores.
+
+Rejections are 740 barge-ins, 232 unusable replies, 73 wrong or unidentified
+language, 66 turns that never opened or said nothing, and 2 tool calls. All are
+deliberate: barge-in and tool calls are FT_EN's own behaviour and stay in the
+frozen LM's weights.
+
+The pilot's 0.854 was measured **without** the trace-parse gate, which is why
+the full pool reads lower rather than because anything degraded; see the run
+log's trace-slicing entry.
+
+### Changing the turn path changed the teacher's answers, not just their timing
+
+Over the 3,046 clip/prompt pairs usable under both paths, the duplex reply and
+the v1 `run_turn` reply agree at a median token F1 of **0.600**, and only 21.8%
+are identical. At temperature 0 the decode is deterministic, so this is not
+sampling: the context genuinely differs, because the model picks its own BOS
+position instead of having one forced and hears encoded silence instead of a
+zero vector after the command.
+
+This settles a question the subset check could not. Regenerating B1 was not a
+cleanup of slightly noisy labels — the v1 targets were *a different target*.
+Roughly four fifths of the pool would have taught the student a reply the
+teacher does not give on the path deployment runs.
+
 ## Two preconditions the refit had beyond the teacher, both now met
 
 Regenerating B1 fixed the supervision but not the graph that consumes it.
