@@ -235,10 +235,12 @@ anywhere, which removes the hardest data constraint.
 
 - **B1, interface anchor (English).** SLURP audio held out from A. Target is
   what the *original* VoiceChat (`F` encoder + original `proj`) emits on that
-  same clip. Pure self-distillation, no annotation. Key property: **the original
-  `proj` achieves zero loss on B1 by construction**, so initialising there
-  starts this term at 0 and it acts as an interface regulariser with a
-  meaningful floor.
+  same clip. Pure self-distillation, no annotation. The original projection is
+  the reference for the interface anchor. **Clarified 2026-09-09:** generated
+  hard tokens do not imply zero cross-entropy at initialization, even for the
+  same model, and the teacher/fitting precisions can differ. Measure that
+  starting loss and compare held-out English before/after fitting; do not
+  assume a zero floor.
 - **B2, multilingual transfer.** Speech-MASSIVE fr/de/ru `dev` minus the A draw.
   Target is the frozen LM run text-only on the transcript, under the condition's
   system prompt.

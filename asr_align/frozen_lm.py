@@ -11,6 +11,7 @@ which cannot propagate gradients from the response back to audio frames.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,29 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .experiments import ExperimentValidationError
+
+
+FITTING_GRAPH_VERSION = "voicechat-duplex-fusion-v2"
+
+
+def fusion_weights_from_config(config: dict) -> dict[str, float]:
+    """Read the original VoiceChat channel weights, also exported to GGUF.
+
+    The language-model architecture config alone does not contain these.
+    In the pinned checkpoint the function channel has weight 2, including
+    PAD tokens and system-prompt conditioning (voicechat-cli.cpp:step).
+    """
+    try:
+        stt = config["model"]["stt"]["model"]
+        values = {name: float(stt[key]) for name, key in (
+            ("text", "duplex_text_channel_weight"),
+            ("audio", "duplex_user_channel_weight"),
+            ("function", "duplex_function_channel_weight"))}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ExperimentValidationError("original VoiceChat fusion configuration is required") from exc
+    if any(not math.isfinite(value) for value in values.values()):
+        raise ExperimentValidationError("VoiceChat fusion weights must be finite")
+    return values
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, groups: int = 1) -> torch.Tensor:
@@ -182,6 +206,8 @@ class FrozenVoiceChatLM(nn.Module):
         if precision not in {"nf4", "bf16", "bf16_cpu_offload"}:
             raise ExperimentValidationError(f"unknown fitting precision {precision}")
         self.config = json.loads(config_path.read_text())
+        self.fusion_weights = fusion_weights_from_config(
+            json.loads((checkpoint_path.parent / "config.json").read_text()))
         self.precision, self.device_name = precision, device
         self.used_keys = set()
         with safe_open(checkpoint_path, framework="pt", device="cpu") as source:
@@ -210,6 +236,13 @@ class FrozenVoiceChatLM(nn.Module):
     def embed(self, ids: torch.Tensor):
         return F.embedding(ids.cpu(), self.embedding).to(self.device_name)
 
+    def fuse(self, audio: torch.Tensor, text_ids: torch.Tensor, function_ids: torch.Tensor):
+        # Runtime fusion accumulates in F32 before the LM's precision boundary.
+        w = self.fusion_weights
+        return (w["text"] * self.embed(text_ids).float()
+                + w["function"] * self.embed(function_ids).float()
+                + w["audio"] * audio.float())
+
     def forward(self, inputs_embeds, *, prefix=None, return_state=False, checkpoint_blocks=True):
         x = inputs_embeds.to(torch.bfloat16)
         states = []
@@ -234,8 +267,8 @@ class FrozenVoiceChatLM(nn.Module):
         # both output channels remain at pad (voicechat-cli.cpp:run_system).
         previous_text = torch.full_like(ids, 12)
         previous_text[:, 0] = 1
-        pad = self.embed(torch.tensor([[12]]))
-        _, states = self(self.embed(ids) + self.embed(previous_text) + pad, return_state=True)
+        inputs = self.fuse(self.embed(ids), previous_text, torch.full_like(ids, 12))
+        _, states = self(inputs, return_state=True)
         return states
 
     def assert_frozen(self):

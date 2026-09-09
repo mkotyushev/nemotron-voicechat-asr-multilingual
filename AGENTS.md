@@ -320,6 +320,62 @@ embedding/activation outputs required by `EXPERIMENTS_TODO.md`.
 
 ## First steps for the next comparison
 
+### Comparison 7 fitting-graph correction (2026-09-09)
+
+The original `comparison-7-interface-v1` E1 fit used unit weight for the
+function-token embedding in both the audio timeline and cached system prefix.
+The original VoiceChat configuration (`model.stt.model`) and the pinned
+runtime's function-head metadata instead require channel weights text=1,
+audio=1, function=2. The runtime applies these weights even to PAD tokens.
+The v1 English CE gate passed inside the mismatched graph; that verdict must
+not authorize further fits. Preserve v1 artifacts and measurements as diagnostic
+evidence rather than overwriting or promoting them.
+
+The correction restores the existing served graph, with no invariant, data
+budget, teacher, or training-objective change. Read all three weights from the
+original checkpoint configuration, use the same F32 fusion operation for the
+system prefix and audio timeline, and record the configuration hash and
+`voicechat-duplex-fusion-v2` graph version in experiment/candidate provenance.
+Start a fresh experiment at `comparison-7-interface-v2-fusion`, recalibrate its
+loss weights from E1, refit E1 from its original initialization, and rerun the
+English and deployment control checks before E2–E4. Frozen Dataset B, teacher
+targets and encoder caches can be reused unchanged: none depends on the
+student's channel-fusion operation. Do not resume a v1 optimizer checkpoint
+under the corrected graph. The 25/50/100% budgets and two-epoch settings remain
+unchanged. `COMPARISON_7_RESULTS.md` records the evidence and limits.
+The specification's earlier claim that B1 hard-target CE is zero by
+construction is also corrected: measure its initialization loss. This is a
+clarification of the existing self-distillation objective, not a new loss.
+
+### Comparison 7: the fusion fix is not why the pilot was silent (2026-09-09)
+
+The correction above is kept, but the ablation it called for has since run and
+shows it does not explain the v1 deployment failure: under the corrected graph
+the v1 fitted projection still improves held-out English CE by about 0.090 nats
+over the original in both prompt cells. **The corrected E1 refit is therefore
+held**, because the supervision it would consume still carries the defect that
+did cause the silence.
+
+The measured cause is that this experiment straddles the runtime's two turn
+paths. B1 targets were recorded through `vc_session::run_turn`, the whole-wav
+path, which honours `VC_FORCE_BOS` and passes `a = nullptr` after the wav — an
+exact zero audio embedding, a convention `interface_fit.duplex_inputs`
+reproduces. The deployment pilot runs `vc_session::duplex_step` through the
+Realtime bridge, which clears `hold_bos` and `want_bos` every frame and feeds
+encoded PCM silence on an input underrun. Given the tail deployment actually
+sends, the v1 fitted projection never opens a turn on 24/24 held-out English
+turns; the original answers 24/24.
+
+Two further defects follow from the same place and also need a decision before
+any arm is refit: the objective is a uniform mean over frames that are 63.7%
+PAD, so 64% of the v1 fit's measured gain sits on two per-trace onset frames —
+a constant EOS at frame 9 and the forced BOS — 39% on more confident silence,
+and the reply content is slightly worse; and the English gate is that same
+uniform mean, so it certified −0.11 nats for a projection that cannot open a
+turn. Do not treat a gate pass as a deployment result until the gate includes a
+free-running check on the duplex path with an encoded-silence tail.
+`COMPARISON_7_RESULTS.md` records the four-cell measurement and the artifacts.
+
 `simple-average`'s exported artifact in the Comparison 6 output is arm `E4`'s
 encoder for Comparison 7 and is already evaluated pre-quantization; reuse it
 rather than rebuilding it. Comparison 6 also freezes Dataset A, whose SLURP

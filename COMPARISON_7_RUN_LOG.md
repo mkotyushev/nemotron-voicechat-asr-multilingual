@@ -1,12 +1,18 @@
 # Comparison 7 run log: end-to-end interface fitting, and the merge ablation
 
-**Status: in progress. No arm has been fitted and no result is claimed.** This
+**Status: v1 E1 is a negative diagnostic run. It passed its internal CE gate
+but failed the deployment control (no response on all 12 clips). Its fitting
+graph omitted the function channel's factor of 2. The graph is corrected and
+v2 is prepared; E2–E4 remain held pending a corrected E1.** This
 file records what is frozen, what has been verified, and what the next stage
 is, so the run can be resumed without re-deriving any of it. Measurements
-belong in `COMPARISON_7_RESULTS.md` when there are any; the §11 gating checks
+are indexed in `COMPARISON_7_RESULTS.md`; the §11 gating checks
 that unblocked this comparison are already in `COMPARISON_7_GATE_RESULTS.md`.
 
-Experiment output directory: `.cache/experiments/comparison-7-interface-v1`.
+Original output: `.cache/experiments/comparison-7-interface-v1` (preserved).
+Corrected output: `.cache/experiments/comparison-7-interface-v2-fusion`.
+The following v1 setup and teacher history remains valid for the reused inputs;
+v1's optimizer checkpoint and gradient calibration must not be reused.
 
 ## Frozen inputs
 
@@ -66,10 +72,14 @@ manifest and in `experiment.json`, as two conditions rather than a column.
 | `targets-text` (B2) | **complete**: 10,020 targets, all present and digest-valid |
 | `targets-audio` (B1) | **complete**: 4,066 targets, all present and digest-valid |
 | `freeze-targets` | **frozen**: 14,086 entries, 11,874 retained, no cell emptied |
-| `fit` | **E1 at 100% running**, ~0.59 s/example over 10,700 examples × 2 epochs |
-| `gate` | implemented; blocked on E1's fit finishing |
-| `export` | implemented **and exercised** on a scratch E1 fit; blocked on a real one |
-| shared evaluation, MASSIVE `test` scoring, quantization, speech-to-action | not started |
+| `fit` | **E1 at 100% complete**, 2,676 updates over 10,700 examples × 2 epochs; other fits pending |
+| `gate` | v1 passed internally, but is invalid for authorizing further fits after the graph audit |
+| `export` | **E1 exported**; all 636 encoder tensors byte-identical and all four interface/featurizer tensors exact |
+| quantization | v1 E1 Q8 artifact matches rounding exactly; runtime parity passed |
+| shared evaluation | v1 E1 pre/post complete with frozen Comparison 1 arrays; R² −2.254609 / −2.255960 |
+| speech-to-action | v1 E1: 0/6 English and 0/6 Russian calls, no assistant turns; original control recheck running |
+| corrected fit | v2 prepared with weighted duplex fusion, targets/caches reused, fresh calibration and E1 fit pending |
+| MASSIVE `test` scoring | pending |
 
 The frozen encoder outputs, one cache per arm over the same 7,043 clips:
 
@@ -237,38 +247,66 @@ reading B1 losses, which are distillation distances and not correctness.
 
 ## Resume commands
 
+**Do not run the corrected E1 refit yet.** The fusion-weight correction is
+sound and its tests pass, but it is not why the pilot was silent, and the
+supervision the refit would consume still carries the defect that was. The
+measured cause is in `COMPARISON_7_RESULTS.md`, "Why the pilot was silent":
+the B1 targets were recorded through the runtime's whole-wav `run_turn` path,
+which forces the turn-opening BOS and drops the audio channel to an exact zero
+vector after the wav; the Realtime bridge that the pilot uses forces nothing
+and feeds encoded PCM silence instead. Fed the tail deployment actually sends,
+the v1 fitted projection never opens a turn on 24/24 held-out English turns,
+while the original projection answers 24/24.
+
+So B1 supervision, the uniform-frame objective and the English gate each need a
+recorded decision before any arm is refit. Running the command below unchanged
+would be expected to reproduce the silent pilot at a cost of about 3.5 GPU
+hours plus export and evaluation.
+
 ```bash
-# encoder caches (one arm at a time; each holds ~3 GB next to the teachers)
-.venv-align/bin/python interface_fitting.py cache --arm E2 \
-  --output .cache/experiments/comparison-7-interface-v1 --device cuda
-
-# B2 targets, resumable per clip and prompt
-.venv-align/bin/python interface_fitting.py targets-text \
-  --endpoint http://127.0.0.1:9099 \
-  --teacher-model /srv/bulk/ai/models/NemotronLabs-VoiceChat-11B-gguf/nemotron_voicechat_11b-stt-llm-Q8_0.gguf \
-  --teacher-binary .cache/tools/llama.cpp/llama-b10819/llama-server \
-  --massive .cache/datasets/MASSIVE/1.1/data \
-  --output .cache/experiments/comparison-7-interface-v1
-
-# B1 targets: the container must serve the ORIGINAL perception encoder, not a
-# candidate, and VC_DUMP=1 must reach it (asr_align/gating.py injects it).
-.venv-align/bin/python interface_fitting.py targets-audio \
-  --massive .cache/datasets/MASSIVE/1.1/data \
-  --output .cache/experiments/comparison-7-interface-v1
-
-.venv-align/bin/python interface_fitting.py freeze-targets \
-  --output .cache/experiments/comparison-7-interface-v1
+# HELD pending the decisions above, not ready to run
 .venv-align/bin/python interface_fitting.py fit --arm E1 --budget 100 \
-  --output .cache/experiments/comparison-7-interface-v1
+  --precision nf4 --epochs 2 --learning-rate 0.0003 --accumulate 8 --seed 0 \
+  --output .cache/experiments/comparison-7-interface-v2-fusion
 .venv-align/bin/python interface_fitting.py gate \
-  --output .cache/experiments/comparison-7-interface-v1
+  --output .cache/experiments/comparison-7-interface-v2-fusion
 ```
+
+The three diagnostics behind that hold need no server and about 25 GPU minutes
+in total. They read only frozen artifacts and write only into `analysis/`:
+
+```bash
+.venv-align/bin/python .cache/experiments/comparison-7-pad-mass-diagnostic.py
+.venv-align/bin/python .cache/experiments/comparison-7-free-running-diagnostic.py duplex
+.venv-align/bin/python .cache/experiments/comparison-7-silence-tail-diagnostic.py
+```
+
+The last one is the useful survivor: it free-runs a projection under the
+bridge's duplex rules with an encoded-silence tail and reports whether the
+model opens a turn at all. It answers in about 6 GPU minutes what previously
+took a 3.5 h fit, an export and a container pilot to discover, and it would
+have blocked v1.
 
 ## Open items the next session should not rediscover
 
-- **Both teachers are stopped and the card is free for fitting.** Target
-  generation is done, so neither the container nor the text server is needed
-  until the evaluation stages; the E1 fit sits at 9.4 GB of 24.
+- **The runtime has two turn paths and this experiment straddles them.**
+  `vc_session::run_turn` is the legacy whole-wav path; `PerceptionPathEngine`
+  drives it with `{"cmd":"turn","audio":...}` and it produced every B1 teacher
+  trace. It honours `VC_NO_BARGE` and `VC_FORCE_BOS` and passes `a = nullptr`
+  after the wav, an exact zero audio embedding.
+  `vc_session::duplex_step` is what the Realtime bridge drives with
+  `duplex_start` / `audio_frame`, and it is what the deployment pilot measures.
+  It clears `hold_bos` and `want_bos` every frame, so neither variable applies
+  and the model must emit BOS itself, and `bridge/server.py::_audio_loop` feeds
+  encoded PCM silence on an input underrun rather than zeros. `runtime.env`
+  flags this above the three variables: "Legacy whole-wav turn mode. The
+  Realtime bridge uses the duplex stream path." Check which path a claim comes
+  from before comparing it with another.
+- **Teacher generation is complete.** The server was temporarily restarted for
+  the v1 deployment pilot and original-control recheck, then stopped again for
+  the corrected diagnostic and fitting. The original control again produced
+  4/6 English calls and responded on all 12 clips. Do not leave the server
+  occupying the GPU during the fit; E1 needs about 9.4 GB of 24.
 - **It was previously serving Comparison 6's merge**, and had held 14.6 GB
   since that comparison finished 21 hours earlier — enough to make the fitting
   backward fail in `cublasCreate`, so the loop could only be measured after it

@@ -12,7 +12,7 @@ import torch
 
 from asr_align import dataset_b, export, interface_fit, manifests
 from asr_align.experiments import ExperimentValidationError, sha256_file
-from asr_align.frozen_lm import FrozenBlock, FrozenLinear, ssd_scan
+from asr_align.frozen_lm import FITTING_GRAPH_VERSION, FrozenBlock, FrozenLinear, FrozenVoiceChatLM, fusion_weights_from_config, ssd_scan
 from asr_align.interface_fit import (
     calibrate_pool_weights,
     duplex_inputs,
@@ -146,8 +146,55 @@ class ScanTests(unittest.TestCase):
 
 
 class SupervisionTests(unittest.TestCase):
+    def test_fusion_comes_from_original_voicechat_config_and_rejects_missing_weights(self):
+        stt = {"duplex_text_channel_weight": 1.0, "duplex_user_channel_weight": 1.0,
+               "duplex_function_channel_weight": 2.0}
+        self.assertEqual(fusion_weights_from_config({"model": {"stt": {"model": stt}}}),
+                         {"text": 1.0, "audio": 1.0, "function": 2.0})
+        for config in ({}, {"model": {"stt": {"model": {**stt, "duplex_function_channel_weight": float("nan")}}}}):
+            with self.assertRaises(ExperimentValidationError):
+                fusion_weights_from_config(config)
+
+    def test_system_prefix_uses_the_runtime_weighted_duplex_equation(self):
+        class TinyLM(FrozenVoiceChatLM):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.fusion_weights = {"text": 1.0, "audio": 1.0, "function": 2.0}
+
+            def embed(self, ids):
+                return ids[..., None].to(torch.bfloat16).expand(*ids.shape, 2)
+
+            def forward(self, inputs, **kwargs):
+                self.observed = inputs
+                return inputs, ["prefix"]
+
+        lm = TinyLM()
+        self.assertEqual(lm.cache_prompt([1, 42, 2]), ["prefix"])
+        # Runtime starts text at BOS, then holds both output channels at PAD.
+        # Each frame is 1*text + 2*function + 1*conditioning audio/text.
+        expected = torch.tensor([[[26., 26.], [78., 78.], [38., 38.]]])
+        torch.testing.assert_close(lm.observed, expected, rtol=0, atol=0)
+        self.assertEqual(lm.observed.dtype, torch.float32)
+
+    def test_legacy_experiment_cannot_resume_after_fusion_fix(self):
+        from interface_fitting import validate_fitting_graph
+        with self.assertRaisesRegex(ExperimentValidationError, "prepare a new experiment"):
+            validate_fitting_graph({})
+
+    def test_resume_checkpoint_is_bound_to_its_graph_and_candidate(self):
+        from interface_fitting import validate_resume_checkpoint
+        good = {"fitting_graph_version": FITTING_GRAPH_VERSION, "provenance_sha256": "candidate-a"}
+        validate_resume_checkpoint(good, "candidate-a")
+        for saved in ({}, {**good, "fitting_graph_version": "legacy"},
+                      {**good, "provenance_sha256": "candidate-b"}):
+            with self.assertRaises(ExperimentValidationError):
+                validate_resume_checkpoint(saved, "candidate-a")
+
     def test_student_duplex_timeline_uses_previous_tokens_and_zero_post_audio(self):
         class Embeddings:
+            fusion_weights = {"text": 1.0, "audio": 1.0, "function": 2.0}
+            fuse = FrozenVoiceChatLM.fuse
+
             def embed(self, ids):
                 return ids[..., None].float().expand(*ids.shape, 2)
         proj = torch.nn.Linear(2, 2)
@@ -156,9 +203,9 @@ class SupervisionTests(unittest.TestCase):
             proj.bias.fill_(7)
         timeline = text_target_timeline([42, 43], 2)
         inputs, labels = duplex_inputs(proj, Embeddings(), torch.ones(2, 2), timeline)
-        torch.testing.assert_close(inputs[0, 0], torch.tensor([32., 32.]))
+        torch.testing.assert_close(inputs[0, 0], torch.tensor([44., 44.]))
         # First post-audio frame consumes two PAD channels and NO proj.bias.
-        torch.testing.assert_close(inputs[0, 2], torch.tensor([24., 24.]))
+        torch.testing.assert_close(inputs[0, 2], torch.tensor([36., 36.]))
         self.assertEqual(labels[2].item(), 1)
         self.assertEqual(labels[3].item(), 42)
 

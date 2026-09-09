@@ -67,7 +67,7 @@ def duplex_inputs(projection: nn.Linear, lm: Any, features: torch.Tensor, timeli
     audio = projected[indices.clamp_min(0)] * (indices >= 0).unsqueeze(-1)
     previous_text = torch.cat([torch.tensor([PAD]), text[:-1]])
     previous_function = torch.cat([torch.tensor([PAD]), function[:-1]])
-    inputs = audio.unsqueeze(0) + lm.embed(previous_text[None]) + lm.embed(previous_function[None])
+    inputs = lm.fuse(audio.unsqueeze(0), previous_text[None], previous_function[None])
     return inputs, text.to(features.device)
 
 
@@ -102,7 +102,7 @@ def calibrate_pool_weights(norms: Mapping[str, Sequence[float]]) -> dict[str, An
 def candidate_provenance(*, arm: str, budget: int, manifest: Mapping[str, Any],
                          source: Mapping[str, Any], initialization: Mapping[str, Any],
                          language_model: Mapping[str, Any], targets: Mapping[str, Any],
-                         calibration: Mapping[str, Any]) -> dict[str, Any]:
+                         calibration: Mapping[str, Any], fitting_graph: Mapping[str, Any]) -> dict[str, Any]:
     dataset_b.validate_manifest(manifest)
     if arm not in dataset_b.ARMS or budget not in dataset_b.BUDGETS:
         raise ExperimentValidationError("unknown Comparison 7 arm or data budget")
@@ -121,6 +121,7 @@ def candidate_provenance(*, arm: str, budget: int, manifest: Mapping[str, Any],
              "system_prompts": dict(gating.SYSTEM_PROMPTS),
              "teacher_paths": dict(manifest["teacher_paths"]), "targets": dict(targets),
              "language_model": dict(language_model), "loss_calibration": dict(calibration),
+             "fitting_graph": dict(fitting_graph),
              "trainable_tensors": ["proj.weight", "proj.bias"],
              "precision_stage": "pre_quantization"}
     value["provenance_sha256"] = stable_json_sha256(value)

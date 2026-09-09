@@ -402,7 +402,8 @@ Fit `proj` by token cross-entropy through the frozen VoiceChat language model,
 and use it to ablate whether the merge of comparison 6 was needed at all.
 
 `COMPARISON_7_RUN_LOG.md` tracks this comparison while it runs: what is frozen,
-what each stage has produced, and how to resume. It records no result.
+what each stage has produced, and how to resume. Partial measured results are
+indexed in `COMPARISON_7_RESULTS.md`; they do not mark the comparison complete.
 
 Invariant 6 authorises a gradient-fitted projection for this comparison, and
 invariant 3 requires the fitting precision to be recorded. Every arm below must
@@ -432,7 +433,8 @@ to generate targets.
   `build_comparison()` still has to enforce.
 - [x] Build Dataset B on clips disjoint from Dataset A:
   - **B1**, SLURP `val` audio, target = what the original VoiceChat emits on the
-    same clip. The original `proj` reaches zero loss on B1 by construction.
+    same clip. The original `proj` is the self-distillation reference; measure
+    its hard-target token cross-entropy rather than assuming it is zero.
   - **B2**, Speech-MASSIVE `dev` remainder, target = the frozen LM run text-only
     on the **native-language** transcript under the condition's prompt.
 

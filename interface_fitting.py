@@ -25,7 +25,7 @@ from asr_align.experiments import (
     sha256_file,
     stable_json_sha256,
 )
-from asr_align.frozen_lm import FrozenVoiceChatLM
+from asr_align.frozen_lm import FITTING_GRAPH_VERSION, FrozenVoiceChatLM, fusion_weights_from_config
 from asr_align.interface_fit import (
     candidate_provenance,
     calibrate_pool_weights,
@@ -78,6 +78,13 @@ def prepare(args):
     # The complete run record is pinned as well as the initialization artifact.
     folded_record = record(folded)
     initializations = {arm: dict(folded_record if arm == "E2" else sources["E1"]) for arm in dataset_b.ARMS}
+    voicechat_config = next(dict(f) for f in setup.value["checkpoints"]["F"]["files"]
+                           if Path(f["path"]).name == "config.json")
+    fitting_graph = {
+        "version": FITTING_GRAPH_VERSION, "voicechat_config": voicechat_config,
+        "fusion_weights": fusion_weights_from_config(json.loads(Path(voicechat_config["path"]).read_text())),
+        "fusion_accumulation": "float32 before LM precision cast; same weights in prompt and audio paths",
+    }
     expected3 = next(f for f in run3["artifact"]["files"] if f["path"] == "model.safetensors")
     if any(initializations["E2"][k] != expected3[k] for k in ("bytes", "sha256")):
         raise ExperimentValidationError("E2 initialization differs from the frozen Comparison 3 artifact")
@@ -90,7 +97,8 @@ def prepare(args):
              "tokenizer": record(args.lm_reference / "tokenizer.json"),
              "runtime_configuration": setup.value["candidate_runtime_configuration"],
              "system_prompts": gating.SYSTEM_PROMPTS, "arms": dataset_b.ARMS,
-             "budgets": dataset_b.BUDGETS, "E1_required_first": True}
+             "budgets": dataset_b.BUDGETS, "E1_required_first": True,
+             "fitting_graph": fitting_graph}
     result = write_frozen(args.output / "experiment.json", value)
     LOG.info("Prepared experiment %s", result["manifest_sha256"])
 
@@ -101,6 +109,30 @@ def load_experiment(root: Path):
     data = read_frozen(Path(experiment["dataset_b"]["path"]))
     dataset_b.validate_manifest(data)
     return experiment, data
+
+
+def validate_fitting_graph(experiment):
+    """Never resume or gate a legacy fit silently under the corrected graph."""
+    graph = experiment.get("fitting_graph", {})
+    if graph.get("version") != FITTING_GRAPH_VERSION:
+        raise ExperimentValidationError(
+            "legacy fitting graph omitted VoiceChat's function-channel weight; "
+            "prepare a new experiment and refit E1, preserving the old artifacts")
+    configuration = graph["voicechat_config"]
+    verify_record(configuration)
+    expected_path = Path(experiment["sources"]["E1"]["path"]).parent / "config.json"
+    if Path(configuration["path"]).resolve() != expected_path.resolve():
+        raise ExperimentValidationError("fusion configuration is not the original VoiceChat checkpoint's")
+    if graph["fusion_weights"] != fusion_weights_from_config(json.loads(expected_path.read_text())):
+        raise ExperimentValidationError("frozen fitting fusion weights differ from the checkpoint")
+    verify_record(experiment["lm_config"])
+    return graph
+
+
+def validate_resume_checkpoint(saved, provenance_sha256):
+    if (saved.get("fitting_graph_version") != FITTING_GRAPH_VERSION
+            or saved.get("provenance_sha256") != provenance_sha256):
+        raise ExperimentValidationError("optimizer checkpoint belongs to another fitting graph or candidate")
 
 
 def arm_weights(experiment, arm):
@@ -351,6 +383,7 @@ def load_training_items(root, data, targets, budget, arm, *, split="train"):
 def fit(args):
     from safetensors.torch import load_file, save_file
     experiment, data = load_experiment(args.output)
+    fitting_graph = validate_fitting_graph(experiment)
     targets = read_frozen(args.output / "targets/index.json")
     if targets["dataset_b_sha256"] != data["manifest_sha256"]:
         raise ExperimentValidationError("teacher targets use another Dataset B")
@@ -366,6 +399,8 @@ def fit(args):
     validation, _ = load_training_items(args.output, data, targets, args.budget, args.arm, split="validation")
     if not items or not validation:
         raise ExperimentValidationError("empty training or validation selection")
+    LOG.info("%s %d%% %s: %d training and %d validation clip/prompt examples; verifying source checkpoint",
+             args.arm, args.budget, args.precision, len(items), len(validation))
     source = arm_weights(experiment, args.arm)
     if final_map.encoder_byte_digest(source) != cache["encoder"]:
         raise ExperimentValidationError("encoder cache differs from the arm source")
@@ -375,6 +410,8 @@ def fit(args):
         projection.bias.copy_(source["proj.bias"])
     del source
     gc.collect()
+    LOG.info("Source verified; loading the frozen %s LM with fusion weights %s",
+             args.precision, fitting_graph["fusion_weights"])
     lm = FrozenVoiceChatLM(Path(experiment["sources"]["E1"]["path"]), Path(experiment["lm_config"]["path"]),
                            precision=args.precision, device=args.device)
     tok = tokenizer(experiment)
@@ -383,9 +420,13 @@ def fit(args):
     calibration_path = args.output / "loss_calibration.json"
     if calibration_path.exists():
         calibration = read_frozen(calibration_path)
+        if (calibration.get("fitting_graph_sha256") != stable_json_sha256(fitting_graph)
+                or calibration.get("dataset_b_sha256") != data["manifest_sha256"]):
+            raise ExperimentValidationError("loss calibration belongs to another fitting graph or dataset")
     else:
         if args.arm != "E1":
             raise ExperimentValidationError("E1 gradient calibration must be frozen first")
+        LOG.info("Calibrating E1 pool weights under fitting graph %s", FITTING_GRAPH_VERSION)
         norms, calibration_ids = {"B1": [], "B2": []}, []
         # Equal conditions/languages in calibration; no validation/test scores.
         cells = sorted({(i["pool"], i["language"], i["condition"]) for i in items})
@@ -400,11 +441,13 @@ def fit(args):
                 norms[item["pool"]].append(float(norm))
                 calibration_ids.append([item["clip_id"], item["condition"]])
         calibration = write_frozen(calibration_path, {**calibrate_pool_weights(norms), "items": calibration_ids,
-                                                       "precision": args.precision, "dataset_b_sha256": data["manifest_sha256"]})
+                                                       "precision": args.precision, "dataset_b_sha256": data["manifest_sha256"],
+                                                       "fitting_graph_sha256": stable_json_sha256(fitting_graph)})
+    LOG.info("Frozen loss weights: %s", calibration["weights"])
     provenance = candidate_provenance(arm=args.arm, budget=args.budget, manifest=data,
                                      source=experiment["sources"][args.arm], initialization=experiment["initializations"][args.arm],
                                      language_model={**experiment["sources"]["E1"], "fitting_precision": args.precision},
-                                     targets=targets, calibration=calibration)
+                                     targets=targets, calibration=calibration, fitting_graph=fitting_graph)
     settings = {"epochs": args.epochs, "learning_rate": args.learning_rate, "gradient_accumulation": args.accumulate,
                 "optimizer": "AdamW", "weight_decay": 0.0, "seed": args.seed, "gradient_clip_norm": 1.0}
     write_frozen(output / "provenance.json", {**provenance, "settings": settings})
@@ -413,9 +456,12 @@ def fit(args):
     checkpoint_path = output / "resume.pt"
     if checkpoint_path.exists():
         saved = torch.load(checkpoint_path, map_location=args.device, weights_only=True)
+        validate_resume_checkpoint(saved, provenance["provenance_sha256"])
         projection.load_state_dict(saved["projection"])
         optimizer.load_state_dict(saved["optimizer"])
         step, start_epoch, cursor = saved["step"], saved["epoch"], saved["cursor"]
+        LOG.info("Resuming %s at epoch=%d examples=%d/%d step=%d",
+                 output.name, start_epoch + 1, cursor, len(items), step)
     for epoch in range(start_epoch, args.epochs):
         generator = torch.Generator().manual_seed(args.seed + epoch)
         order = torch.randperm(len(items), generator=generator).tolist()
@@ -440,20 +486,22 @@ def fit(args):
                      args.arm, args.budget, args.precision, epoch + 1, start + len(batch), len(order), step, measured, norm)
             temp = output / "resume.tmp"
             torch.save({"projection": projection.state_dict(), "optimizer": optimizer.state_dict(),
+                        "fitting_graph_version": FITTING_GRAPH_VERSION,
+                        "provenance_sha256": provenance["provenance_sha256"],
                         "step": step, "epoch": epoch, "cursor": start + len(batch)}, temp)
             temp.replace(checkpoint_path)
-    cells = {}
-    with torch.no_grad():
-        for item in validation:
-            loss = token_loss(projection, lm, item["features"].to(args.device), item["timeline"], prefixes[item["condition"]])
-            cells.setdefault(f"{item['pool']}/{item['language']}/{item['condition']}", []).append(float(loss))
+    LOG.info("%s optimizer updates complete; validating %d clip/prompt examples before writing result.json",
+             output.name, len(validation))
+    cells = scored_cells(projection, lm, validation, prefixes, args.device)
     path = output / "projection.safetensors"
     save_file({"proj.weight": projection.weight.detach().cpu().contiguous(),
                "proj.bias": projection.bias.detach().cpu().contiguous()}, path)
     write_frozen(output / "result.json", {"status": "fit_complete_evaluations_pending", "projection": record(path),
                                           "provenance_sha256": provenance["provenance_sha256"], "steps": step,
                                           "encoder": cache["encoder"], "train_examples": len(items),
-                                          "validation_token_ce": {k: {"n": len(v), "mean": sum(v) / len(v)} for k, v in cells.items()}})
+                                          "validation_token_ce": cells})
+    LOG.info("Fit complete: %s (%d optimizer steps); English gate and deployment evaluations remain separate",
+             output / "result.json", step)
 
 
 def linear_from(weight: torch.Tensor, bias: torch.Tensor, device: str) -> torch.nn.Linear:
@@ -476,10 +524,12 @@ def read_fit(root: Path, arm: str, budget: int, precision: str):
 def scored_cells(projection, lm, items, prefixes, device) -> dict:
     cells: dict[str, list[float]] = {}
     with torch.no_grad():
-        for item in items:
+        for index, item in enumerate(items, 1):
             loss = token_loss(projection, lm, item["features"].to(device), item["timeline"],
                               prefixes[item["condition"]])
             cells.setdefault(f"{item['pool']}/{item['language']}/{item['condition']}", []).append(float(loss))
+            if index % 100 == 0 or index == len(items):
+                LOG.info("Validation scored %d/%d clip/prompt examples", index, len(items))
     return {key: {"n": len(values), "mean": sum(values) / len(values)} for key, values in cells.items()}
 
 
@@ -489,6 +539,7 @@ def english_gate(args):
     from safetensors.torch import load_file
 
     experiment, data = load_experiment(args.output)
+    validate_fitting_graph(experiment)
     targets = read_frozen(args.output / "targets/index.json")
     if targets["dataset_b_sha256"] != data["manifest_sha256"]:
         raise ExperimentValidationError("teacher targets use another Dataset B")
@@ -497,6 +548,8 @@ def english_gate(args):
     english = [item for item in validation if item["pool"] == "B1"]
     if not english:
         raise ExperimentValidationError("the English gate needs held-out B1 clips")
+    LOG.info("E1 English gate: verifying the source and loading %s LM; %d clips under both prompts",
+             args.precision, len(english) // len(gating.SYSTEM_PROMPTS))
     source = arm_weights(experiment, "E1")
     if final_map.encoder_byte_digest(source) != cache["encoder"] or cache["encoder"] != result["encoder"]:
         raise ExperimentValidationError("the gate encoder differs from the fitted E1 source")
@@ -522,7 +575,7 @@ def english_gate(args):
                           "fit_result": record(fit_root / "result.json"),
                           "projection": dict(result["projection"]), "encoder": cache["encoder"],
                           "measured": measured, **verdict})
-    LOG.info("E1 English gate %s: %+.5f nats against the initialization over %d held-out clips",
+    LOG.info("E1 English gate %s: %+.5f nats against the initialization over %d held-out clip/prompt examples",
              "passed" if value["passed"] else "FAILED", value["delta"], value["clips_scored"])
     if not value["passed"]:
         raise ExperimentValidationError(
@@ -590,6 +643,119 @@ def export_artifact(args):
     LOG.info("Exported %s to %s", fit_root.name, artifact)
 
 
+def evaluate_artifact(args):
+    """Shared pre/post metrics using the exact frozen Comparison 1 arrays.
+
+    These encoder/projection metrics do not consume a system prompt. The two
+    output-language conditions still require separate speech-to-action tables.
+    """
+    import sys
+    import tempfile
+
+    import direct_task_arithmetic as direct_runner
+    import pt_ml_baseline as baseline_runner
+    from asr_align import data as audio_data, direct, evaluation
+    from safetensors.torch import load_file
+
+    experiment, _ = load_experiment(args.output)
+    fit_root, result, provenance = read_fit(args.output, args.arm, args.budget, args.precision)
+    exported = read_frozen(args.output / "artifacts" / f"{fit_root.name}.json")
+    if (exported["experiment_sha256"] != experiment["manifest_sha256"]
+            or exported["provenance_sha256"] != result["provenance_sha256"]):
+        raise ExperimentValidationError("exported artifact belongs to another fit or experiment")
+    for file in exported["files"]:
+        verify_record(file)
+    artifact = Path(exported["artifact"])
+    output = args.output / "evaluations" / fit_root.name
+    if output.exists():
+        raise ExperimentValidationError("shared evaluation is already frozen; use a new output directory")
+    LOG.info("Verifying frozen shared setup and Comparison 1 reference")
+    verify_record(experiment["shared_setup"])
+    shared = baseline.load_shared_setup(Path(experiment["shared_setup"]["path"]))
+    reference = direct.load_baseline_reference(args.baseline, shared)
+    work = Path(reference.run["runtime_reader"]["path"]).resolve()
+    reader = baseline_runner._runtime_reader_provenance(work)
+    pre = weights.load_asr(artifact, mmproj_precision=False)
+    if final_map.encoder_byte_digest(pre) != result["encoder"]:
+        raise ExperimentValidationError("exported encoder differs from the fitted arm")
+    fitted = load_file(result["projection"]["path"])
+    baseline.assert_exact_tensors(fitted, pre, keys=("proj.weight", "proj.bias"))
+    pt_ml_config = json.loads((shared.pt_ml_path / "config.json").read_text())
+    assert_runtime_config_inherited(pre.config, pt_ml_config["encoder_config"])
+    post = weights.load_mmproj(args.deployment, work, config=pre.config)
+    simulated = weights.load_asr(artifact, mmproj_precision=True)
+    quantization_check = baseline.assert_exact_tensors(simulated, post)
+    quantization = baseline.quantization_report(pre, post)
+    del simulated
+    gc.collect()
+    fleurs = manifests.load_manifest(shared.fleurs_manifest)
+    manifests.verify_audio_files(fleurs, root=Path(fleurs["root"]))
+    clips = audio_data.from_frozen_manifest(shared.librispeech_manifest)["validation"]
+    if not clips:
+        raise ExperimentValidationError("empty frozen LibriSpeech validation split")
+    device = torch.device(args.device)
+    torch.manual_seed(shared.seed)
+    torch.use_deterministic_algorithms(True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=output.parent))
+    results, files = {}, []
+    for stage, state in (("pre_quantization", pre), ("post_quantization", post)):
+        LOG.info("Shared evaluation: %s %s", fit_root.name, stage)
+        model = encoder.build(state).to(device)
+        with torch.inference_mode():
+            bundle = {
+                "librispeech": direct_runner._collect_librispeech(
+                    model, clips, batch_size=args.batch,
+                    eval_frames=int(reference.run["evaluation"]["english_frame_cap"]),
+                    device=device, mel_filters=state["featurizer.fb"], window=state["featurizer.window"],
+                    candidate_name=fit_root.name),
+                "fleurs": direct_runner._collect_fleurs(
+                    model, fleurs, device=device, mel_filters=state["featurizer.fb"],
+                    window=state["featurizer.window"], candidate_name=fit_root.name),
+            }
+        frozen = direct_runner._read_reference_bundle(reference, stage, fleurs["languages"])
+        measured = direct_runner._evaluate_stage(
+            candidate_name=fit_root.name, weight=None, stage=stage, candidate_bundle=bundle,
+            reference_bundle=frozen, manifest_hashes=shared.manifest_hashes,
+            seed=shared.seed, comparison=interface_fit.COMPARISON)
+        evaluation.write_result(temporary / f"{stage}.json", measured)
+        direct_runner._write_candidate_embeddings(
+            temporary / f"{stage}.safetensors", bundle, candidate_name=fit_root.name,
+            weight=None, stage=stage, manifest_hashes=shared.manifest_hashes,
+            comparison=interface_fit.COMPARISON)
+        results[stage] = measured
+        del model, bundle, frozen
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    evaluation.validate_precision_pair(results["pre_quantization"], results["post_quantization"])
+    for file in sorted(temporary.iterdir()):
+        files.append({**record(file), "path": str((output / file.name).resolve())})
+    write_frozen(temporary / "run.json", {
+        "comparison": interface_fit.COMPARISON, "candidate_id": fit_root.name,
+        "status": "shared_evaluation_complete_deployment_endpoints_separate",
+        "command": [str(Path(sys.executable).resolve()), *sys.argv],
+        "fit_result": record(fit_root / "result.json"),
+        "fit_provenance": record(fit_root / "provenance.json"),
+        "fitting_precision": args.precision, "system_prompts": provenance["system_prompts"],
+        "shared_setup": record(shared.path), "manifests": shared.manifest_hashes,
+        "artifact_index": record(args.output / "artifacts" / f"{fit_root.name}.json"),
+        "deployment": record(args.deployment), "runtime_reader": reader,
+        "paired_baseline_run": record(reference.run_path),
+        "paired_baseline_embeddings": record(reference.embeddings_path),
+        "exact_frozen_baseline_arrays_used": True,
+        "actual_artifact_matches_rounding_model": quantization_check,
+        "quantization": quantization,
+        "precision_delta": baseline.precision_metric_delta(results["pre_quantization"], results["post_quantization"]),
+        "files": files,
+        "environment": {"python": sys.version, "torch": torch.__version__, "numpy": np.__version__,
+                        "device": str(device), "seed": shared.seed, "tf32": False,
+                        "deterministic_algorithms": True},
+    })
+    temporary.rename(output)
+    LOG.info("Shared evaluation complete: %s; speech-to-action and MASSIVE scoring remain separate", output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -636,7 +802,15 @@ def main():
     artifact.add_argument("--budget", type=int, choices=dataset_b.BUDGETS, required=True)
     artifact.add_argument("--precision", choices=("nf4", "bf16_cpu_offload"), default="nf4")
     artifact.set_defaults(run=export_artifact)
-    for command in (prep, cache, target, audio, freeze, train, verdict, artifact):
+    evaluate = sub.add_parser("evaluate")
+    evaluate.add_argument("--arm", choices=dataset_b.ARMS, required=True)
+    evaluate.add_argument("--budget", type=int, choices=dataset_b.BUDGETS, required=True)
+    evaluate.add_argument("--precision", choices=("nf4", "bf16_cpu_offload"), default="nf4")
+    evaluate.add_argument("--baseline", type=Path, required=True)
+    evaluate.add_argument("--deployment", type=Path, required=True)
+    evaluate.add_argument("--batch", type=int, default=4)
+    evaluate.set_defaults(run=evaluate_artifact)
+    for command in (prep, cache, target, audio, freeze, train, verdict, artifact, evaluate):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--device", default="cuda")
         command.add_argument("--threads", type=int, default=12)
