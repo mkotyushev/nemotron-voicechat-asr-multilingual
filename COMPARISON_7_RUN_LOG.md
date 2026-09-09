@@ -64,10 +64,10 @@ manifest and in `experiment.json`, as two conditions rather than a column.
 | `prepare` | frozen, reproducible |
 | `cache` (frozen encoder outputs) | **all four arms frozen**, 7,043 clips and 1.4 GB each |
 | `targets-text` (B2) | **complete**: 10,020 targets, all present and digest-valid |
-| `targets-audio` (B1) | running, ~17 s/turn over 4,066 turns |
-| `freeze-targets` | blocked on B1 |
-| `fit` | blocked on targets; E1 must run first |
-| `gate` | implemented this session; blocked on E1's fit |
+| `targets-audio` (B1) | **complete**: 4,066 targets, all present and digest-valid |
+| `freeze-targets` | **frozen**: 14,086 entries, 11,874 retained, no cell emptied |
+| `fit` | **E1 at 100% running**, ~0.59 s/example over 10,700 examples × 2 epochs |
+| `gate` | implemented; blocked on E1's fit finishing |
 | `export` | implemented **and exercised** on a scratch E1 fit; blocked on a real one |
 | shared evaluation, MASSIVE `test` scoring, quantization, speech-to-action | not started |
 
@@ -163,14 +163,47 @@ output on a non-tool turn. At 4% of traces it is worth asking whether a whole
 clip should be dropped for one such frame, or whether the rule should be about
 the function channel actually opening a call.
 
-**This was put to the decision and the guard was kept as written**, so the full
-run supervises only turns with a clean function channel and pays about 4% of
-B1 for it. It is a decision rather than an oversight: `usable` and `timeline`
-are frozen per target file at generation time and `write_frozen` will not
-replace them, so revisiting the rule later means regenerating B1 into a new
-directory — the stored `runtime_trace` makes a re-parse possible in principle,
-but not in place. If it is ever revisited, it is a supervision change and
-belongs in the design record.
+**This was put to the decision and the guard was kept as written.** It is a
+decision rather than an oversight: `usable` and `timeline` are frozen per target
+file at generation time and `write_frozen` will not replace them, so revisiting
+the rule later means regenerating B1 into a new directory — the stored
+`runtime_trace` makes a re-parse possible in principle, but not in place.
+
+**Over the full pool it cost far less than the sample implied**: 29 rejections
+in 4,066 traces, **0.7%** rather than 4%. The 48-trace sample was simply
+unlucky, which is worth remembering the next time a rate is read off a smoke
+test here.
+
+## B1 teacher quality, complete
+
+All 4,066 targets present and digest-valid, no error in the run, 17.7 hours of
+turns at a median 14.4 s (max 59.8). Timelines are median 70 frames, from 28 to
+300.
+
+| | prompt A | prompt B |
+|---|---:|---:|
+| usable | 0.94 | 0.95 |
+
+**Paired retention is 0.93** (1,898 of 2,033), even across train and
+validation — much healthier than B2's 0.81, because B1's teacher is being asked
+only to answer its own English audio, not to hold an output language.
+
+## The frozen supervision
+
+`freeze-targets` wrote 14,086 entries, one per clip and prompt, of which
+**11,874 (84%) are retained**, and no language/prompt cell was emptied:
+
+| split | B1 en | B2 de | B2 fr | B2 ru |
+|---|---:|---:|---:|---:|
+| train | 0.93 | 0.78 | 0.80 | 0.85 |
+| validation | 0.93 | 0.74 | 0.78 | 0.86 |
+
+The **loss calibration is frozen from E1 and inherited by every arm**, which is
+what makes the arms comparable: median initial projection-gradient norms are
+2.93 on B1 and 5.07 on B2, so the pools enter the objective at weights 1.27 and
+0.73 with mean one. That is the measured answer to the gate result that equal
+term weights are not defensible — B1 and B2 losses are not on the same scale,
+and this puts them there by gradient size rather than by assumption.
 
 The teacher also mishears: on SLURP 10017 the original VoiceChat answers about
 poaching truffles. That is not a defect here — B1's target is by definition
@@ -233,10 +266,9 @@ reading B1 losses, which are distillation distances and not correctness.
 
 ## Open items the next session should not rediscover
 
-- **The container is now up on the original perception encoder**
-  (`ASR_MODEL=container`), because B1 is running against it, and the B2 text
-  teacher is stopped. Before the first `fit`, stop the container again: §10
-  budgets ~8 GB for NF4 and the container alone holds 14.6 GB.
+- **Both teachers are stopped and the card is free for fitting.** Target
+  generation is done, so neither the container nor the text server is needed
+  until the evaluation stages; the E1 fit sits at 9.4 GB of 24.
 - **It was previously serving Comparison 6's merge**, and had held 14.6 GB
   since that comparison finished 21 hours earlier — enough to make the fitting
   backward fail in `cublasCreate`, so the loop could only be measured after it
