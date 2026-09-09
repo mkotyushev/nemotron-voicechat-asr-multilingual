@@ -598,6 +598,177 @@ class PerceptionPathEngine:
             self.trace.close()
 
 
+class DuplexPerceptionEngine:
+    """The same CLI, driven the way `bridge/engine.py` drives it.
+
+    `PerceptionPathEngine` sends `{"cmd":"turn"}` and gets `run_turn`, which
+    honours `VC_FORCE_BOS` and `VC_NO_BARGE` and passes a null audio pointer
+    once the wav is spent.  The Realtime bridge instead sends `duplex_start`
+    followed by one `audio_frame` per 80 ms, reaching `duplex_step`, which
+    clears both flags and keeps the model on real encoder frames throughout.
+    The clock does not stop when the command does: the bridge advances the model
+    on silence, and so does this.
+
+    One process, one conversation; `reset` clears the duplex flag, so each clip
+    is reset, system, duplex_start.
+    """
+
+    #: bridge/server.py MODEL_CHUNK: 80 ms of 16 kHz PCM16.
+    FRAME_SAMPLES = 1280
+
+    def __init__(
+        self,
+        *,
+        container: str,
+        model: str,
+        mmproj: str,
+        n_gpu_layers: int = 24,
+        threads: int = 12,
+        extra_decoding_seconds: float = 50.0,
+        session_seconds: float = 180.0,
+        ready_timeout: float = 900.0,
+        frame_timeout: float = 600.0,
+        trace_path: Path | None = None,
+    ):
+        self.arguments = [
+            "docker", "exec", "-i", container,
+            "/app/llama-voicechat",
+            "-m", model,
+            "--mmproj", mmproj,
+            "--serve",
+            "--temp", "0",
+            "-ngl", str(n_gpu_layers),
+            "-t", str(threads),
+            "--extra-decoding-seconds", str(extra_decoding_seconds),
+            "--session-seconds", str(session_seconds),
+        ]
+        self.frame_timeout = frame_timeout
+        self.errors: list[dict[str, Any]] = []
+        self.trace = None
+        if trace_path is not None:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            self.trace = trace_path.open("w", encoding="utf-8")
+            self.arguments[2:2] = ["-e", "VC_DUMP=1"]
+        self.process = subprocess.Popen(
+            self.arguments,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.trace if self.trace is not None else subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        self._await("ready", ready_timeout)
+
+    def _send(self, command: Mapping[str, Any]) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.write(json.dumps(command, ensure_ascii=False) + "\n")
+        self.process.stdin.flush()
+
+    def _await(self, kind: str, timeout: float, collect: list | None = None) -> dict[str, Any]:
+        assert self.process.stdout is not None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = self.process.stdout.readline()
+            if not line:
+                raise ExperimentValidationError(
+                    f"the voicechat CLI exited before emitting {kind!r}"
+                )
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("kind") == "error":
+                self.errors.append(dict(event))
+                continue
+            if collect is not None:
+                collect.append(event)
+            if event.get("kind") == kind:
+                return event
+        raise ExperimentValidationError(f"timed out waiting for {kind!r} from the voicechat CLI")
+
+    def generate(self, prompt: str, samples, *, lead_frames: int = 8,
+                 tail_frames: int = 150) -> dict[str, Any]:
+        import base64
+
+        import numpy
+
+        before = len(self.errors)
+        started = time.monotonic()
+        self._send({"cmd": "reset"})
+        self._await("reset", self.frame_timeout)
+        self._send({"cmd": "system", "text": prompt})
+        system_event = self._await("system", self.frame_timeout)
+        self._send({"cmd": "duplex_start"})
+        self._await("duplex_start", self.frame_timeout)
+
+        pcm = (numpy.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2")
+        blocks = [pcm[i:i + self.FRAME_SAMPLES] for i in range(0, len(pcm), self.FRAME_SAMPLES)]
+        if blocks and len(blocks[-1]) < self.FRAME_SAMPLES:
+            blocks[-1] = numpy.pad(blocks[-1], (0, self.FRAME_SAMPLES - len(blocks[-1])))
+        silence = numpy.zeros(self.FRAME_SAMPLES, dtype="<i2")
+        events: list[dict[str, Any]] = []
+        seq = 0
+
+        def frame(block, speaking: bool, epoch: int) -> int:
+            nonlocal seq
+            self._send({"cmd": "audio_frame", "seq": seq,
+                        "audio": base64.b64encode(block.tobytes()).decode("ascii"),
+                        "speech_epoch": epoch, "input_speaking": speaking})
+            event = self._await("duplex_frame", self.frame_timeout, collect=events)
+            seq += 1
+            return int(event.get("frames", 0))
+
+        # The streaming encoder decides where the command ends, not the block
+        # count: it has startup latency and the last block is zero padded, so the
+        # acknowledged frame counts are the only exact boundary.
+        command_encoder_frames = 0
+        for _ in range(lead_frames):
+            command_encoder_frames += frame(silence, False, 0)
+        for block in blocks:
+            command_encoder_frames += frame(block, True, 1)
+
+        response_end = None
+        tail_sent = 0
+        while tail_sent < tail_frames:
+            frame(silence, False, 1)
+            tail_sent += 1
+            response_end = next((e for e in events if e.get("kind") == "response_end"), None)
+            if response_end is not None:
+                break
+
+        start_event = next((e for e in events if e.get("kind") == "response_start"), None)
+        command_end_t = int(system_event.get("t", 0)) + command_encoder_frames
+        return {
+            "text": "" if response_end is None else str(response_end.get("text", "")),
+            "opened": start_event is not None,
+            "onset_frames_past_command": (None if start_event is None
+                                          else int(start_event["t"]) - command_end_t),
+            "command_encoder_frames": command_encoder_frames,
+            "command_blocks": len(blocks),
+            "lead_frames": lead_frames,
+            "tail_frames_sent": tail_sent,
+            "system_end_t": int(system_event.get("t", 0)),
+            "spoken": None if response_end is None else response_end.get("spoken"),
+            "frames": None if response_end is None else response_end.get("frames"),
+            "seconds": round(time.monotonic() - started, 3),
+            "errors": self.errors[before:],
+        }
+
+    def close(self) -> None:
+        try:
+            self._send({"cmd": "quit"})
+        except (BrokenPipeError, ValueError, AssertionError):
+            pass
+        try:
+            self.process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        if self.trace is not None:
+            self.trace.close()
+
+
 class TextPathEngine:
     """A stock llama.cpp server completing the checkpoint's inherited chat format.
 

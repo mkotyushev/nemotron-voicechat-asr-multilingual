@@ -53,6 +53,57 @@ def parse_audio_trace(trace: str, *, prefix_frames: int, audio_frames: int) -> d
             "schedule": "B1: exact original VoiceChat per-frame teacher trace; no function splices"}
 
 
+#: A duplex turn may open no earlier than this many frames before the streaming
+#: encoder has consumed the command.  One or two frames is boundary slop -- the
+#: encoder has its own startup latency and the last block is zero padded -- and
+#: those replies are complete and on topic.  An opening well inside the command
+#: is barge-in: real FT_EN behaviour, but not something to supervise here, since
+#: it would teach the student to answer before it has heard the request.
+DUPLEX_ONSET_TOLERANCE_FRAMES = 4
+#: How long the teacher may take to open its turn.  The frozen FT_EN control
+#: answers about 1.4 s past the audio in the deployment pilot.
+DUPLEX_MAX_ONSET_FRAMES = 50
+
+
+def parse_duplex_trace(trace: str, *, prefix_frames: int) -> dict[str, Any]:
+    """The teacher's own per-frame trace, with nothing forced.
+
+    Unlike `parse_audio_trace` this keeps the function channel as traced rather
+    than rejecting spontaneous activity, and it records no audio indices: the
+    duplex timeline has an encoder frame at every position -- the command, then
+    encoded silence -- so how it maps onto a cached encoder run is settled when
+    the cache is built, not here.
+    """
+    frames = re.findall(r"DUMP t=\s*(\d+).*?txt=\s*(\d+).*?fn=\s*(\d+)", trace)
+    frames = [(int(t), int(txt), int(fn)) for t, txt, fn in frames if int(t) >= prefix_frames]
+    if not frames or [f[0] for f in frames] != list(range(prefix_frames, prefix_frames + len(frames))):
+        raise ExperimentValidationError("incomplete or noncontiguous duplex teacher frame trace")
+    return {"text_tokens": [txt for _, txt, _ in frames],
+            "function_tokens": [fn for _, _, fn in frames],
+            "schedule": "duplex: the teacher's own frame trace; the turn is opened by the model, "
+                        "not by VC_FORCE_BOS, and every frame has an encoder frame behind it"}
+
+
+def duplex_turn_rejections(*, opened: bool, onset: int | None, spoken: int | None,
+                           tolerance: int = DUPLEX_ONSET_TOLERANCE_FRAMES,
+                           max_onset: int = DUPLEX_MAX_ONSET_FRAMES) -> list[str]:
+    """Why this duplex turn may not be supervised, if it may not."""
+    rejections = []
+    if not opened:
+        rejections.append("never opened a turn")
+        return rejections
+    if onset is None:
+        rejections.append("no measurable turn onset")
+        return rejections
+    if onset < -tolerance:
+        rejections.append(f"barged in {-onset} frames before the command ended")
+    elif onset > max_onset:
+        rejections.append(f"took {onset} frames to open")
+    if not spoken:
+        rejections.append("opened a turn but said nothing")
+    return rejections
+
+
 def duplex_inputs(projection: nn.Linear, lm: Any, features: torch.Tensor, timeline: Mapping[str, Any]):
     """Same-frame CE: the model consumes the PREVIOUS output tokens plus audio."""
     text = torch.tensor(timeline["text_tokens"], dtype=torch.long)

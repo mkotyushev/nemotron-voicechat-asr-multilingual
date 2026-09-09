@@ -16,8 +16,10 @@ from asr_align.frozen_lm import FITTING_GRAPH_VERSION, FrozenBlock, FrozenLinear
 from asr_align.interface_fit import (
     calibrate_pool_weights,
     duplex_inputs,
+    duplex_turn_rejections,
     english_gate_verdict,
     parse_audio_trace,
+    parse_duplex_trace,
     text_target_timeline,
 )
 
@@ -218,6 +220,34 @@ class SupervisionTests(unittest.TestCase):
             parse_audio_trace(trace.replace("t=3", "t=8"), prefix_frames=2, audio_frames=2)
         with self.assertRaises(ExperimentValidationError):
             parse_audio_trace(trace.replace("fn=12", "fn=20"), prefix_frames=2, audio_frames=2)
+
+    def test_duplex_trace_keeps_function_activity_and_records_no_audio_indices(self):
+        # The duplex timeline has an encoder frame at every position -- the
+        # command, then encoded silence -- so it carries no -1 audio index, and
+        # unlike run_turn it does not reject spontaneous function tokens.
+        trace = "\n".join(f"DUMP t={i} txt={token} 'x' top=0 fn={fn}"
+                          for i, (token, fn) in enumerate([(12, 12), (12, 12), (1, 12), (42, 20), (2, 12)]))
+        timeline = parse_duplex_trace(trace, prefix_frames=2)
+        self.assertEqual(timeline["text_tokens"], [1, 42, 2])
+        self.assertEqual(timeline["function_tokens"], [12, 20, 12])
+        self.assertNotIn("audio_indices", timeline)
+        with self.assertRaises(ExperimentValidationError):
+            parse_duplex_trace(trace.replace("t=3", "t=8"), prefix_frames=2)
+
+    def test_duplex_rejects_barge_in_but_tolerates_boundary_slop(self):
+        tolerance = interface_fit.DUPLEX_ONSET_TOLERANCE_FRAMES
+        # Opening a frame or two before the encoder formally consumed the
+        # command is boundary slop; those replies are complete and on topic.
+        self.assertEqual(duplex_turn_rejections(opened=True, onset=-tolerance, spoken=9), [])
+        self.assertEqual(duplex_turn_rejections(opened=True, onset=4, spoken=9), [])
+        # Opening well inside the command is barge-in, which stays FT_EN's.
+        self.assertTrue(duplex_turn_rejections(opened=True, onset=-tolerance - 1, spoken=9))
+        self.assertTrue(duplex_turn_rejections(opened=True, onset=None, spoken=9))
+        self.assertTrue(duplex_turn_rejections(opened=False, onset=None, spoken=None))
+        self.assertTrue(duplex_turn_rejections(
+            opened=True, onset=interface_fit.DUPLEX_MAX_ONSET_FRAMES + 1, spoken=9))
+        # A turn that opened and then said nothing supervises nothing.
+        self.assertTrue(duplex_turn_rejections(opened=True, onset=4, spoken=0))
 
     def test_english_gate_fails_a_single_regressed_prompt_cell(self):
         initialization = {"B1/en/A_english_only": {"n": 100, "mean": .40},

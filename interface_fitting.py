@@ -29,7 +29,9 @@ from asr_align.frozen_lm import FITTING_GRAPH_VERSION, FrozenVoiceChatLM, fusion
 from asr_align.interface_fit import (
     candidate_provenance,
     calibrate_pool_weights,
+    duplex_turn_rejections,
     english_gate_verdict,
+    parse_duplex_trace,
     text_target_timeline,
     token_loss,
 )
@@ -322,6 +324,110 @@ def target_audio(args):
                                    "runtime_trace": traced})
             if index % 10 == 0:
                 LOG.info("B1 targets %d/%d clips under both prompts", index + 1, len(rows))
+    finally:
+        engine.close()
+
+
+def target_audio_duplex(args):
+    """B1, regenerated on the turn path deployment actually uses.
+
+    `target_audio` drives `vc_session::run_turn`, which forces the opening BOS
+    and hands the model an exact zero audio embedding once the wav is spent.
+    Neither happens in `duplex_step`, which is what the Realtime bridge runs, so
+    a projection fitted against those traces learns to wait for a cue that never
+    arrives.  This streams the command 80 ms at a time and then keeps the clock
+    running on silence, exactly as `bridge/server.py::_audio_loop` does.
+
+    Barge-in is not supervised: it is FT_EN's own behaviour, it stays in the
+    frozen LM, and teaching it here would train the student to answer before it
+    has heard the request.
+    """
+
+    from lm_gating_check import _container_provenance
+    import io
+    import soundfile
+
+    experiment, data = load_experiment(args.output)
+    dataset_b.verify_audio(data)
+    header = {"path": "original_voicechat_audio_duplex", "teacher_precision": "Q8_0",
+              "runtime": _container_provenance(args.container, args.teacher_model, args.teacher_mmproj),
+              "dataset_b_sha256": data["manifest_sha256"], "system_prompts": gating.SYSTEM_PROMPTS,
+              "n_gpu_layers": args.n_gpu_layers, "lead_frames": args.lead_frames,
+              "tail_frames": args.tail_frames,
+              "onset_tolerance_frames": interface_fit.DUPLEX_ONSET_TOLERANCE_FRAMES,
+              "max_onset_frames": interface_fit.DUPLEX_MAX_ONSET_FRAMES,
+              "turn_path": "vc_session::duplex_step via duplex_start/audio_frame",
+              "command_boundary": "summed encoder frames acknowledged by duplex_frame",
+              "rules": ["the model opens its own turn: duplex_step clears want_bos and hold_bos",
+                        "reject a turn opened more than the tolerance before the command ended",
+                        "after the command the model hears encoded silence, never a zero embedding"],
+              "frame_trace": "VC_DUMP=1; original text and function tokens at every 80ms frame"}
+    output = args.output / "targets" / "B1-duplex"
+    write_frozen(output / "provenance.json", header)
+    identifier, quality = gating.fit_language_identifier(args.massive)
+    write_frozen(output / "language_identifier.json", quality)
+    trace = output / "runtime-trace.log"
+
+    engine = gating.DuplexPerceptionEngine(
+        container=args.container, model=args.teacher_model, mmproj=args.teacher_mmproj,
+        n_gpu_layers=args.n_gpu_layers, extra_decoding_seconds=args.extra_decoding_seconds,
+        session_seconds=args.session_seconds, trace_path=trace)
+    try:
+        rows = [r for group in data["splits"].values() for r in group if r["pool"] == "B1"]
+        if args.limit:
+            rows = rows[:args.limit]
+        LOG.info("B1 duplex regeneration: %d clips under %d prompts", len(rows), len(gating.SYSTEM_PROMPTS))
+        for index, row in enumerate(rows):
+            samples, rate = soundfile.read(manifests.resolve_take(Path(data["root"]), row), dtype="float32")
+            if rate != features.SAMPLE_RATE:
+                raise ExperimentValidationError(f"{row['clip_id']}: {rate} Hz, not the featurizer's rate")
+            for condition, system in gating.SYSTEM_PROMPTS.items():
+                path = output / f"{row['clip_id'].replace('/', '-')}-{condition}.json"
+                if path.exists():
+                    old = read_frozen(path)
+                    if old["teacher_provenance_sha256"] != stable_json_sha256(header):
+                        raise ExperimentValidationError("B1 duplex target teacher provenance changed")
+                    continue
+                offset = trace.stat().st_size
+                reply = engine.generate(system, samples, lead_frames=args.lead_frames,
+                                        tail_frames=args.tail_frames)
+                with trace.open("rb") as stream:
+                    stream.seek(offset)
+                    traced = stream.read().decode("utf-8", errors="replace")
+                # The runtime reports where conditioning ended; a tokenizer
+                # estimate of it is off by a frame on some prompts.
+                prefix_frames = reply["system_end_t"]
+                timeline, rejected = None, None
+                try:
+                    timeline = parse_duplex_trace(traced, prefix_frames=prefix_frames)
+                except ExperimentValidationError as exc:
+                    rejected = str(exc)
+                score_row = {"path": "perception", "prompt_id": condition, "language": "en",
+                             "id": row["utterance_id"], "intent": row["intent"],
+                             "utterance": row["transcript"], "reply": reply["text"]}
+                scored = gating.score_rows([score_row], identifier)["rows"][0]
+                rejections = duplex_turn_rejections(opened=reply["opened"],
+                                                    onset=reply["onset_frames_past_command"],
+                                                    spoken=reply["spoken"])
+                if reply.get("errors"):
+                    rejections.append("runtime error")
+                if not scored["usable"]:
+                    rejections.append("reply not usable")
+                if scored["identified_language"] != "en":
+                    rejections.append(f"reply identified as {scored['identified_language']}")
+                if timeline is None:
+                    rejections.append(f"trace rejected: {rejected}")
+                write_frozen(path, {"clip_id": row["clip_id"], "condition": condition,
+                                    "teacher_provenance_sha256": stable_json_sha256(header),
+                                    "reply": reply, "score": scored,
+                                    "usable": not rejections, "rejections": rejections,
+                                    "command_encoder_frames": reply["command_encoder_frames"],
+                                    "lead_frames": reply["lead_frames"],
+                                    "onset_frames_past_command": reply["onset_frames_past_command"],
+                                    "timeline": timeline, "trace_rejection": rejected,
+                                    "runtime_trace": traced})
+            if index % 10 == 0:
+                LOG.info("B1 duplex targets %d/%d clips under both prompts", index + 1, len(rows))
     finally:
         engine.close()
 
@@ -781,6 +887,18 @@ def main():
     audio.add_argument("--massive", type=Path, required=True)
     audio.add_argument("--limit", type=int)
     audio.set_defaults(run=target_audio)
+    duplex = sub.add_parser("targets-audio-duplex")
+    duplex.add_argument("--container", default="nemotron-voicechat")
+    duplex.add_argument("--teacher-model", default="/models/nemotron_voicechat_11b-stt-llm-Q8_0.gguf")
+    duplex.add_argument("--teacher-mmproj", default="/models/mmproj-voicechat-perception-Q8_0.gguf")
+    duplex.add_argument("--n-gpu-layers", type=int, default=24)
+    duplex.add_argument("--massive", type=Path, required=True)
+    duplex.add_argument("--lead-frames", type=int, default=8)
+    duplex.add_argument("--tail-frames", type=int, default=150)
+    duplex.add_argument("--extra-decoding-seconds", type=float, default=50.0)
+    duplex.add_argument("--session-seconds", type=float, default=180.0)
+    duplex.add_argument("--limit", type=int)
+    duplex.set_defaults(run=target_audio_duplex)
     freeze = sub.add_parser("freeze-targets")
     freeze.set_defaults(run=freeze_targets)
     train = sub.add_parser("fit")
@@ -810,7 +928,7 @@ def main():
     evaluate.add_argument("--deployment", type=Path, required=True)
     evaluate.add_argument("--batch", type=int, default=4)
     evaluate.set_defaults(run=evaluate_artifact)
-    for command in (prep, cache, target, audio, freeze, train, verdict, artifact, evaluate):
+    for command in (prep, cache, target, audio, duplex, freeze, train, verdict, artifact, evaluate):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--device", default="cuda")
         command.add_argument("--threads", type=int, default=12)
