@@ -247,9 +247,10 @@ reading B1 losses, which are distillation distances and not correctness.
 
 ## Resume commands
 
-**Do not run the corrected E1 refit yet.** The fusion-weight correction is
-sound and its tests pass, but it is not why the pilot was silent, and the
-supervision the refit would consume still carries the defect that was. The
+**The refit waited on B1 being regenerated, and that is now in flight.** The
+fusion-weight correction is sound and its tests pass, but it is not why the
+pilot was silent, and the v1 supervision the refit would have consumed still
+carried the defect that was. The
 measured cause is in `COMPARISON_7_RESULTS.md`, "Why the pilot was silent":
 the B1 targets were recorded through the runtime's whole-wav `run_turn` path,
 which forces the turn-opening BOS and drops the audio channel to an exact zero
@@ -263,13 +264,38 @@ recorded decision before any arm is refit. Running the command below unchanged
 would be expected to reproduce the silent pilot at a cost of about 3.5 GPU
 hours plus export and evaluation.
 
+The decisions are now taken and implemented; what is left is the order below.
+B1 is regenerating on the duplex path, and the two stages after it cannot start
+until it finishes, because each needs the whole card.
+
 ```bash
-# HELD pending the decisions above, not ready to run
+# 1. B1 on the turn path deployment runs (in flight, ~4 h, one GPU)
+.venv-align/bin/python interface_fitting.py targets-audio-duplex \
+  --massive .cache/datasets/MASSIVE/1.1/data --n-gpu-layers 99 \
+  --output .cache/experiments/comparison-7-interface-v2-fusion
+
+# 2. the encoder cache over the waveform the bridge streams; ~8 GB an arm, so
+#    the tensors go to /srv/bulk while the sidecars stay with the experiment
+.venv-align/bin/python interface_fitting.py cache-duplex --arm E1 \
+  --activation-root /srv/bulk/ai/data/comparison-7/activations-duplex \
+  --output .cache/experiments/comparison-7-interface-v2-fusion
+
+# 3. freeze against the duplex pool rather than the v1 one
+.venv-align/bin/python interface_fitting.py freeze-targets --b1-directory B1-duplex \
+  --output .cache/experiments/comparison-7-interface-v2-fusion
+
+# 4. the refit, and the gate that now also runs the turn free
 .venv-align/bin/python interface_fitting.py fit --arm E1 --budget 100 \
   --precision nf4 --epochs 2 --learning-rate 0.0003 --accumulate 8 --seed 0 \
   --output .cache/experiments/comparison-7-interface-v2-fusion
 .venv-align/bin/python interface_fitting.py gate \
   --output .cache/experiments/comparison-7-interface-v2-fusion
+```
+
+Retention while B1 runs, and the frame-accounting check the cache depends on:
+
+```bash
+.venv-align/bin/python .cache/experiments/comparison-7-b1-duplex-progress.py
 ```
 
 The three diagnostics behind that hold need no server and about 25 GPU minutes
@@ -286,6 +312,58 @@ bridge's duplex rules with an encoded-silence tail and reports whether the
 model opens a turn at all. It answers in about 6 GPU minutes what previously
 took a 3.5 h fit, an export and a container pilot to discover, and it would
 have blocked v1.
+
+## Two measurements the silence tail needed
+
+**Where the streamed frame lands in the cache.** The runtime streams one 80 ms
+block at a time and its encoder emits exactly one frame per block; the cache
+runs the same waveform whole and `features.frames_out` returns one frame more,
+so one cached frame has no counterpart in the stream. The frontend settles
+which. Each of the three stride-2 convolutions pads two mel frames left and one
+right, so its output `j` reads inputs `2j-2 .. 2j`; composed three times,
+cached frame `j` reaches mel frame `8j` — audio through sample `1280 * j`, the
+end of block `j-1`. The frame a streamer emits having just consumed block `i`
+is therefore cached frame `i + 1`, and cached frame 0 is the one the stream
+never emits. `interface_fit.CACHE_FRAME_OFFSET = 1`.
+
+Two probes agree with that without pinning it further, and both are worth not
+repeating. On 40 blocks of pure silence, frames 0 and 1 are the run's largest
+outliers (cosine 0.17 against the steady state, against 0.70 by frame 2, and a
+gradual drift over the last three frames) — so there is no single artifact
+frame at one end, and an argument from "which frame is padding" cannot settle
+it. A one-block full-scale burst perturbs three to four cached frames, from
+about `L` to `L+3`, with a peak that wanders (`+1, +3, +2, +3` for bursts in
+blocks 12, 20, 28, 36) — the encoder attends globally, so no cached frame is a
+function of local audio alone. Half a frame of ambiguity survives, 40 ms either
+way, which is why the offset is a named constant and `fit` and `gate` take
+`--frame-offset`: re-running E1 at 0 and comparing held-out cross-entropy is
+the measurement that would close it.
+
+The teacher's own frame accounting is *not* ambiguous and was checked, not
+assumed: over 416 recorded targets, `command_encoder_frames - lead_frames`
+equals `ceil(n_samples / 1280)` in **416 of 416**, both deltas exact. So the
+padded cache holds the audio the teacher actually heard, and
+`load_training_items` raises if a clip ever disagrees.
+
+**A tenth of the traces were being thrown away by the harness.** One trace file
+carries the whole session and the runtime's stderr is block buffered, so the
+byte offset captured before a turn still has the previous turn's unflushed
+frames after it. Those slices open mid-previous-turn — `t=122..121`, gap
+`(122, 29)` — with this turn's frames all present behind them, and
+`parse_duplex_trace` rejected the lot. It is not a speed artifact: the rate is
+6-15% at 19.4 s per turn and 15.4% at 4.34 s. The pilot's 85.4% retention
+simply never gated on trace parsing, so the production stage was the first
+thing to see it.
+
+The turn is the last contiguous run from the system prompt's last frame, and
+`parse_duplex_trace` now takes it that way; a real hole inside the turn still
+fails. Because each target stores its whole `runtime_trace`, the fix was
+measured before re-running anything: re-parsing the 458 targets on disk
+recovers **all 73** rejected traces, none still failing, and moves retention
+from 64.9% to **78.2%** per target and 49.5% to **70.7%** paired. What remains
+is barge-in (78 targets, deliberately not supervised — it stays FT_EN's own
+task vector) and the reply quality gate (28). The pre-fix partial run is kept
+at `targets/B1-duplex-prebugfix/`.
 
 ## Teacher generation throughput: 4.5x from not paying twice for the card
 

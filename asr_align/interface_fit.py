@@ -327,7 +327,8 @@ def duplex_gate_verdict(fitted: Mapping[str, Any], initialization: Mapping[str, 
 def candidate_provenance(*, arm: str, budget: int, manifest: Mapping[str, Any],
                          source: Mapping[str, Any], initialization: Mapping[str, Any],
                          language_model: Mapping[str, Any], targets: Mapping[str, Any],
-                         calibration: Mapping[str, Any], fitting_graph: Mapping[str, Any]) -> dict[str, Any]:
+                         calibration: Mapping[str, Any], fitting_graph: Mapping[str, Any],
+                         supervision: Mapping[str, Any]) -> dict[str, Any]:
     dataset_b.validate_manifest(manifest)
     if arm not in dataset_b.ARMS or budget not in dataset_b.BUDGETS:
         raise ExperimentValidationError("unknown Comparison 7 arm or data budget")
@@ -338,6 +339,11 @@ def candidate_provenance(*, arm: str, budget: int, manifest: Mapping[str, Any],
             raise ExperimentValidationError(f"missing {name} content hash")
     if targets.get("teacher_paths") != manifest["teacher_paths"] or not targets.get("manifest_sha256"):
         raise ExperimentValidationError("target teacher path or content hash is missing or mismatched")
+    # Where the timeline reads the cache is a free choice with a measured but
+    # not fully pinned answer, so a fit that used another one is a different
+    # candidate and has to hash differently.
+    if "frame_offset" not in supervision or "activation_cache" not in supervision:
+        raise ExperimentValidationError("a fit must record its frame alignment and activation cache")
     value = {"comparison": COMPARISON, "artifact_kind": ARTIFACT_KIND, "arm": arm,
              "data_budget_percent": budget, "arm_definition": dataset_b.ARMS[arm],
              "encoder_source": dict(source), "initialization": dict(initialization),
@@ -346,7 +352,7 @@ def candidate_provenance(*, arm: str, budget: int, manifest: Mapping[str, Any],
              "system_prompts": dict(gating.SYSTEM_PROMPTS),
              "teacher_paths": dict(manifest["teacher_paths"]), "targets": dict(targets),
              "language_model": dict(language_model), "loss_calibration": dict(calibration),
-             "fitting_graph": dict(fitting_graph),
+             "fitting_graph": dict(fitting_graph), "supervision": dict(supervision),
              "trainable_tensors": ["proj.weight", "proj.bias"],
              "precision_stage": "pre_quantization"}
     value["provenance_sha256"] = stable_json_sha256(value)

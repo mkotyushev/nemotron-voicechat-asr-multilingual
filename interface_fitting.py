@@ -706,7 +706,12 @@ def fit(args):
     provenance = candidate_provenance(arm=args.arm, budget=args.budget, manifest=data,
                                      source=experiment["sources"][args.arm], initialization=experiment["initializations"][args.arm],
                                      language_model={**experiment["sources"]["E1"], "fitting_precision": args.precision},
-                                     targets=targets, calibration=calibration, fitting_graph=fitting_graph)
+                                     targets=targets, calibration=calibration, fitting_graph=fitting_graph,
+                                     supervision={"frame_offset": args.frame_offset,
+                                                  "activation_cache": {
+                                                      key: cache[key] for key in
+                                                      ("lead_frames", "tail_frames", "tensor_root",
+                                                       "b1_duplex_provenance_sha256", "padding")}})
     settings = {"epochs": args.epochs, "learning_rate": args.learning_rate, "gradient_accumulation": args.accumulate,
                 "optimizer": "AdamW", "weight_decay": 0.0, "seed": args.seed, "gradient_clip_norm": 1.0}
     write_frozen(output / "provenance.json", {**provenance, "settings": settings})

@@ -354,6 +354,28 @@ class SupervisionTests(unittest.TestCase):
         self.assertFalse(useless["control_calibrated"])
         self.assertFalse(useless["passed"])
 
+    def test_candidate_provenance_hashes_the_frame_alignment_it_trained_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = manifests.write_frozen(Path(tmp) / "b.json", fixture(Path(tmp)))
+            record = {"path": "x", "bytes": 1, "sha256": "a" * 64}
+            common = dict(arm="E1", budget=100, manifest=manifest, source=record,
+                          initialization=record,
+                          language_model={**record, "fitting_precision": "nf4"},
+                          targets={"teacher_paths": manifest["teacher_paths"],
+                                   "manifest_sha256": "b" * 64},
+                          calibration={"weights": {}}, fitting_graph={"version": 1})
+            cache = {"lead_frames": 8, "tail_frames": 213, "tensor_root": "/srv/bulk",
+                     "b1_duplex_provenance_sha256": "c" * 64, "padding": "lead, command, tail"}
+            at_one = interface_fit.candidate_provenance(
+                **common, supervision={"frame_offset": 1, "activation_cache": cache})
+            at_zero = interface_fit.candidate_provenance(
+                **common, supervision={"frame_offset": 0, "activation_cache": cache})
+            # 80 ms of alignment is the difference between two candidates, not
+            # a detail: the same targets under either offset must not collide.
+            self.assertNotEqual(at_one["provenance_sha256"], at_zero["provenance_sha256"])
+            with self.assertRaises(ExperimentValidationError):
+                interface_fit.candidate_provenance(**common, supervision={"frame_offset": 1})
+
     def test_english_gate_fails_a_single_regressed_prompt_cell(self):
         initialization = {"B1/en/A_english_only": {"n": 100, "mean": .40},
                           "B1/en/B_input_language": {"n": 4, "mean": .40}}
