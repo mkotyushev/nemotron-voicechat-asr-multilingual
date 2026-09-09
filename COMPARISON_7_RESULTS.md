@@ -409,6 +409,87 @@ full per-frame `VC_DUMP` trace kept per target; the comparison is
 is `.cache/experiments/comparison-7-duplex-teacher.py`. This is a 12-clip
 subset for shape comparison, not a teacher pool: no fit may consume it.
 
+## The duplex regeneration recipe, and what it retains
+
+Decided: B1 is regenerated through the duplex path, and **barge-in is not
+supervised**. Opening a turn over the user is real FT_EN behaviour and stays in
+the frozen LM's own weights; teaching it here would train the student to answer
+before it has heard the request, and the frozen `run_turn` pool could not
+represent it anyway. The recipe is otherwise the frozen B1 recipe — same
+container, teacher, mmproj and prompts.
+
+Added to it:
+
+- **The command boundary comes from the encoder, not the block count.** The
+  streaming encoder has its own startup latency and the last block is zero
+  padded, so `frames` on each `duplex_frame` acknowledgement is summed instead.
+  Measuring it as blocks-sent was wrong by about a frame: `features.frames_out`
+  is uniformly `blocks + 1` on these clips.
+- **A 4-frame onset tolerance.** A turn opening one or two frames before the
+  encoder has formally consumed the command is boundary slop, not barge-in, and
+  the replies show it: `B1/en/9606` at −2 answers "Which programs would you like
+  to play?" and `B1/en/15269` at −1 answers "I cannot post to your Facebook…" —
+  complete and on topic.
+- **A 0.64 s silence lead-in** before the command, as a live microphone stream
+  has and as the pilot's own clips do (320 ms). At n=48 it moved retention from
+  75% to 81%, which is inside the noise; it is kept because it matches the
+  deployment condition, not because the difference is significant.
+- **The existing usability filter unchanged**, and a rejection if the turn takes
+  more than 50 frames (4 s) to open.
+
+Retention over 48 held-out clips under both prompts, 96 targets:
+
+| | Duplex, this recipe | Frozen B1 (`run_turn`) |
+|---|---:|---:|
+| Per-target retention | 0.854 | 0.94 / 0.95 per prompt |
+| Paired retention (both prompts) | **0.833** (40/48 clips) | 0.93 |
+| Opened a turn | 96/96 | forced |
+| Onset past the command, retained | median 4 frames (0.32 s), −4 to +9 | 0 by construction |
+
+Rejections are 10 barge-ins, 4 unusable replies and 2 with no identified
+language. **Barge-in is deterministic per clip, not sampling noise**: every
+barged-in clip fails under both prompts at nearly the same onset (−10/−10,
+−33/−34, −6/−6, −7/−7, −5/−5), so it is a property of the audio — most likely a
+mid-utterance pause the teacher reads as the end of the turn — and the filter
+that removes it is stable rather than arbitrary.
+
+The onset distribution is the encouraging part: 33 of 82 retained targets open
+at exactly +4 frames and 63 of them within +3 to +5, so the teacher's natural
+turn-taking is consistent enough to be worth supervising. That is the behaviour
+the forced BOS was destroying.
+
+So the pool costs about 17% of its clips against the frozen one, and paired
+retention of 0.833 over B1's 2,033 clips projects to roughly 1,690 retained
+clips against the frozen pool's ~1,890. At the measured ~16 s per turn, 4,066
+turns is about 18 hours, matching what B1 cost.
+
+Artifacts: `targets-duplex-lead0/`, `targets-duplex-lead8/` and
+`targets-duplex-check48/` under the v2 experiment, each with its own
+`provenance.json`, per-target `VC_DUMP` trace and `index.json` carrying the
+retention summary. The generator is
+`.cache/experiments/comparison-7-duplex-subset-check.py`. These are subset
+checks sizing the full run; no fit may consume them.
+
+## Two preconditions the refit still has, beyond the teacher
+
+Regenerating B1 fixes the supervision but not the graph that consumes it.
+
+1. **The training graph still feeds an exact zero audio tail.**
+   `interface_fit.duplex_inputs` computes
+   `projected[indices.clamp_min(0)] * (indices >= 0)`, so every post-command
+   frame is a zero vector. A duplex teacher hears *encoded silence* there, and
+   so does deployment. Left unchanged, the refit would present zeros where its
+   own teacher heard silence — the same train/serve gap with better labels. The
+   encoder cache needs a silence tail per clip and the timeline must index into
+   it instead of zeroing. This is a code change and a cache regeneration.
+2. **The gate must run free, on the deployment tail, and score onset.** A
+   free-running check alone would not have caught v1: with the training-time
+   zero tail both projections answered 48/48. It has to reproduce all three
+   deployment conditions — nothing forces BOS, no barge-in suppression, and an
+   encoded-silence tail — and record whether the turn opened and how many frames
+   past the command, not merely whether tokens appeared. The untouched FT_EN
+   projection is the negative control and passes at 24/24.
+
 ## What has to be decided before any arm is refit
 
 These are changes to the objective and the blocking check defined in
@@ -422,12 +503,44 @@ implementation choice:
    suppressed outright, and 17 of 24 replies differ anyway. Regeneration costs
    what B1 cost — 4,066 runtime turns, about 17.7 hours — so the budget and the
    usability filter are worth settling before it starts.
-2. **The objective.** A uniform mean over frames that are 63.7% PAD rewards
-   confident silence and positional constants over reply content.
+2. **The objective — less is wrong with it than first appeared.** The proposal
+   to keep only N=10 frames of trailing pad is **already satisfied**: measured
+   over all 378 retained B1 validation traces, truncating the tail to 10 drops
+   0.0 frames on average, because `run_turn` ends a turn on a 10-frame pad
+   streak and `text_target_timeline` appends exactly `[PAD] * 10`. The PAD that
+   remains is 47.2% during the command and 13.2% after it, not tail padding.
+   Since the forced BOS carried 64% of the v1 gain and duplex regeneration
+   removes it, the uniform mean may be defensible once the teacher is fixed.
+   The one class still worth masking is the **EOS at frame 9**, where the model
+   closes the system prompt's turn: it is a positional constant in every trace,
+   and the reference has direct precedent for masking a conditioning region.
+   The listening PAD should *not* be masked away — remaining silent while the
+   user speaks is behaviour the reference preserves and measures.
 3. **The English gate.** As the same uniform mean it certified −0.11 nats for a
-   projection that cannot open a turn in deployment. A free-running check on
-   the duplex path with an encoded-silence tail detects that in about 6 GPU
-   minutes and would have blocked v1.
+   projection that cannot open a turn in deployment. It needs the free-running
+   duplex check described above alongside the teacher-forced cross-entropy, and
+   that check must score turn opening explicitly.
+
+### What the reference says, and does not
+
+The repository has no STT-side duplex training recipe. `papers/` holds
+RegMean++ (model merging) and VoiceChat-TTS, which is the *speech decoder*, not
+the duplex text LLM being distilled here. VoiceChat-TTS does supply three
+relevant precedents, and they are consistent with the decisions above:
+
+- The text channel is "right-padded with special padding IDs … until they match
+  the total temporal length of the current conversational turn", so the padded
+  timeline shape is the intended design rather than an artifact.
+- "The loss over this prompt region is masked so that the model uses the prompt
+  as conditioning context rather than learning to reconstruct it" — masking a
+  conditioning region is what the reference does.
+- Silence while the user speaks is treated as behaviour to preserve and is
+  measured: intelligible speech during PAD-designated intervals is scored as
+  ASR insertion error. So the listening PAD is signal, not noise.
+
+How the STT side aggregated its own duplex loss is not recorded here and was
+not found; the decisions above are reasoned from the runtime and from these
+precedents, not from the original recipe.
 
 The fusion-weight correction and its regression tests are sound and are kept.
 

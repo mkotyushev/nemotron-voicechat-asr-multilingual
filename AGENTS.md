@@ -376,6 +376,43 @@ turn. Do not treat a gate pass as a deployment result until the gate includes a
 free-running check on the duplex path with an encoded-silence tail.
 `COMPARISON_7_RESULTS.md` records the four-cell measurement and the artifacts.
 
+### Comparison 7: settled decisions for the corrected refit (2026-09-09)
+
+**B1 is regenerated through the duplex path, and barge-in is not supervised.**
+Opening a turn over the user is FT_EN's own behaviour and stays in the frozen
+LM; supervising it here would teach the student to answer before hearing the
+request. A trace is rejected if the turn opened more than 4 frames before the
+encoder consumed the command, or took more than 50 frames to open; the existing
+usability filter is unchanged; the command boundary is the summed encoder
+frames the runtime acknowledges, not the block count; a 0.64 s silence lead-in
+precedes the command. Measured over 48 clips under both prompts: per-target
+retention 0.854, paired 0.833, onset median 4 frames past the command. Barge-in
+is deterministic per clip, so the filter is stable. Full regeneration is about
+18 hours, the same as B1 cost.
+
+**The tail-padding rule is already satisfied** and needs no change: truncating
+trailing PAD to 10 frames drops 0.0 frames on average, because `run_turn` ends
+on a 10-frame pad streak and `text_target_timeline` appends exactly ten. The
+remaining PAD is 47.2% during the command and 13.2% after. Do not mask the
+listening PAD — the reference preserves and measures that behaviour. The
+frame-9 EOS, where the model closes the system prompt's turn, is the one class
+worth masking, and the reference has precedent for masking conditioning
+regions.
+
+**Two preconditions the refit has beyond the teacher.** First,
+`interface_fit.duplex_inputs` still zeroes the audio channel after the command
+(`projected[i.clamp_min(0)] * (i >= 0)`) while both the duplex teacher and
+deployment hear encoded silence there; the encoder cache needs a silence tail
+and the timeline must index into it. Second, the gate must free-run on the
+duplex path with that same encoded-silence tail and score whether the turn
+opened and when, with the untouched FT_EN projection as the passing control.
+Training stays teacher-forced; only evaluation free-runs.
+
+The fusion weights are confirmed correct and must stay read from the original
+config: `duplex_text_channel_weight` 1.0, `duplex_user_channel_weight` 1.0,
+`duplex_function_channel_weight` 2.0, frozen under graph version
+`voicechat-duplex-fusion-v2`.
+
 `simple-average`'s exported artifact in the Comparison 6 output is arm `E4`'s
 encoder for Comparison 7 and is already evaluated pre-quantization; reuse it
 rather than rebuilding it. Comparison 6 also freezes Dataset A, whose SLURP
