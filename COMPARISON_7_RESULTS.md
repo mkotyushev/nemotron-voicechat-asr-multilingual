@@ -346,6 +346,69 @@ has both projections responding 48/48 with fluent English:
 behavioural proxies in the NF4 fitting harness, not the deployed Q8 runtime
 with its TTS channel and VAD epochs.
 
+## Duplex teacher subset: the frozen traces cannot be repaired
+
+A 12-clip subset (24 clip/prompt targets, the same held-out English clips every
+other Comparison 7 diagnostic uses) was regenerated through the runtime's duplex
+path — same container, same original Q8 teacher, same mmproj, same two system
+prompts, driven over `duplex_start` / `audio_frame` instead of a whole-wav
+`turn`. It is compared against the frozen `run_turn` trace for the same clips
+with its two harness artifacts undone on paper: the forced BOS marked as the
+runtime's rather than the teacher's, and the `-1` audio indices understood as
+encoded silence rather than a zero embedding.
+
+| | Regenerated (duplex) | Repaired (run_turn) |
+|---|---:|---:|
+| Opened a turn | 24/24 | forced, by construction |
+| BOS frame relative to the command end | −33 to +5, 8/24 before it ends | always exactly 0 |
+| Reply text identical between the two | 7/24 | — |
+| EOS at frame 9 | 22/24 | 24/24 |
+| Mean spoken tokens | 19.54 | 18.46 |
+
+**The repair is not a faithful stand-in, and the frozen B1 traces cannot be
+patched into duplex supervision.** Three findings drive that:
+
+- **Onset timing is not recoverable.** In `run_turn` the BOS sits at offset 0 in
+  every trace because `VC_FORCE_BOS` put it there. The duplex teacher opens
+  anywhere from 33 frames before the command ends to 5 frames after. The
+  whole-wav trace carries no information about when the teacher would have
+  chosen to speak, so a repair can only mark the frame as forced — it cannot
+  supply the timing that a duplex student has to learn.
+- **Barge-in cannot be represented at all.** 8 of 24 duplex turns open while the
+  command is still playing, which `VC_NO_BARGE` made impossible in the frozen
+  run. That is a behaviour class absent from the existing targets.
+- **The replies themselves differ**, in 17 of 24 cases, sometimes in meaning
+  rather than wording. On `B1/en/2312` the duplex teacher says "I am unable to
+  control your lights, but I can…" where the frozen trace says "The light is now
+  down to seven." On `B1/en/9606` it asks "Which programs would you like to
+  play?" against the frozen "I cannot play programs, but I can help you with…".
+  So the two teachers are not the same supervision with different framing.
+
+Two things the comparison also settles. The **EOS at frame 9 is real model
+behaviour**, not a `run_turn` artifact: it appears in 22 of 24 duplex traces
+too, where the model closes the system prompt's turn. It remains a positional
+constant that is trivially predictable and should not be allowed to dominate a
+loss, but it is not something regeneration removes. And the **original teacher
+has no difficulty opening its own turn** — 24/24 — so a duplex teacher is
+viable; nothing about the checkpoint requires the forced BOS.
+
+One caution for whoever regenerates the full pool. Early barge-in is genuine
+duplex behaviour but is not always *good* supervision: on `B1/en/10925` the
+teacher opens 33 frames (2.6 s) before the command ends and answers "What would
+you like to do?" instead of addressing the request, having not yet heard it.
+A duplex regeneration needs a usability filter at least as strict as the
+existing one, and probably an explicit check that the turn opened after enough
+of the command to answer it.
+
+Artifacts: the regenerated targets are `targets-duplex/` under the v2
+experiment, index digest
+`0a1bba9e7bf3691d5ab1693c8ea3deba0d00721d4aff807e2e68f17392df49b6`, with the
+full per-frame `VC_DUMP` trace kept per target; the comparison is
+`analysis/teacher_shape_comparison.json`, digest
+`13d0a59633a2bdabadad85147d81b9af581e699d3f4561579ac70a772f67d2f5`. The driver
+is `.cache/experiments/comparison-7-duplex-teacher.py`. This is a 12-clip
+subset for shape comparison, not a teacher pool: no fit may consume it.
+
 ## What has to be decided before any arm is refit
 
 These are changes to the objective and the blocking check defined in
@@ -353,9 +416,12 @@ These are changes to the objective and the blocking check defined in
 implementation choice:
 
 1. **B1 supervision.** The targets encode a forced turn opening and an
-   exact-zero audio tail. Either regenerate them through the duplex path, or
-   exclude the forced-BOS frame and stop training the zero-tail transition, or
-   train turn opening explicitly against encoded silence.
+   exact-zero audio tail. The subset comparison above settles how to fix it:
+   **regenerate through the duplex path**. Repairing the frozen traces cannot
+   work, because onset timing was destroyed by the forced BOS, barge-in was
+   suppressed outright, and 17 of 24 replies differ anyway. Regeneration costs
+   what B1 cost — 4,066 runtime turns, about 17.7 hours — so the budget and the
+   usability filter are worth settling before it starts.
 2. **The objective.** A uniform mean over frames that are 63.7% PAD rewards
    confident silence and positional constants over reply content.
 3. **The English gate.** As the same uniform mean it certified −0.11 nats for a
