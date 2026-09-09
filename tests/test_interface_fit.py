@@ -203,13 +203,35 @@ class SupervisionTests(unittest.TestCase):
         with torch.no_grad():
             proj.weight.copy_(torch.eye(2))
             proj.bias.fill_(7)
+        # Row j of the cache projects to j + 7, so the assertions below say
+        # which cached frame each timeline position actually read.
+        cached = torch.arange(20).float()[:, None].expand(20, 2)
         timeline = text_target_timeline([42, 43], 2)
-        inputs, labels = duplex_inputs(proj, Embeddings(), torch.ones(2, 2), timeline)
+        self.assertEqual(timeline["audio_indices"][:3], [1, 2, 3])
+        inputs, labels = duplex_inputs(proj, Embeddings(), cached, timeline)
+        # Two PAD channels weigh 12 + 2 * 12; the audio is cache row 1.
         torch.testing.assert_close(inputs[0, 0], torch.tensor([44., 44.]))
-        # First post-audio frame consumes two PAD channels and NO proj.bias.
-        torch.testing.assert_close(inputs[0, 2], torch.tensor([36., 36.]))
+        # The first post-command frame is not blank any more: it reads the
+        # cache's encoded silence, bias and all, which is what the Realtime
+        # bridge feeds.  Under the v1 zero tail this frame was 36.
+        torch.testing.assert_close(inputs[0, 2], torch.tensor([46., 46.]))
         self.assertEqual(labels[2].item(), 1)
         self.assertEqual(labels[3].item(), 42)
+
+    def test_duplex_inputs_refuse_a_timeline_with_frames_that_hear_nothing(self):
+        proj = torch.nn.Linear(2, 2)
+        timeline = {"text_tokens": [12, 1], "function_tokens": [12, 12], "audio_indices": [0, -1]}
+        with self.assertRaises(ExperimentValidationError) as caught:
+            duplex_inputs(proj, None, torch.ones(4, 2), timeline)
+        self.assertIn("encoded silence", str(caught.exception))
+
+    def test_duplex_audio_indices_are_contiguous_and_skip_the_lead(self):
+        self.assertEqual(interface_fit.duplex_audio_indices(3, offset=1), [1, 2, 3])
+        # B2's timeline starts at the command, so it steps over the cache's
+        # lead silence; B1's trace covers the lead and does not.
+        self.assertEqual(interface_fit.duplex_audio_indices(3, start=8, offset=1), [9, 10, 11])
+        with self.assertRaises(ExperimentValidationError):
+            interface_fit.duplex_audio_indices(0)
 
     def test_audio_trace_requires_complete_frames_and_rejects_untraced_splices(self):
         trace = "\n".join(f"DUMP t={i} txt={token} 'x' top=0 fn=12" for i, token in enumerate([12, 12, 1, 42, 2]))
@@ -234,6 +256,23 @@ class SupervisionTests(unittest.TestCase):
         with self.assertRaises(ExperimentValidationError):
             parse_duplex_trace(trace.replace("t=3", "t=8"), prefix_frames=2)
 
+    def test_duplex_trace_drops_the_previous_turns_unflushed_frames(self):
+        # The runtime's stderr is block buffered and one file carries the whole
+        # session, so a slice taken by byte offset can open with frames the
+        # previous turn had not written yet: about one target in seven.
+        turn = [(12, 12), (12, 12), (1, 12), (42, 12), (2, 12)]
+        body = "\n".join(f"DUMP t={i} txt={token} 'x' top=0 fn={fn}"
+                         for i, (token, fn) in enumerate(turn))
+        stale = "DUMP t=121 txt=2 'x' top=0 fn=12\nDUMP t=122 txt=12 'x' top=0 fn=12\n"
+        timeline = parse_duplex_trace(stale + body, prefix_frames=2)
+        self.assertEqual(timeline["text_tokens"], [1, 42, 2])
+        # A hole inside this turn is still a rejection, stale head or not.
+        with self.assertRaises(ExperimentValidationError):
+            parse_duplex_trace(stale + body.replace("t=3", "t=9"), prefix_frames=2)
+        # And a slice that never reaches the prompt's last frame is not a turn.
+        with self.assertRaises(ExperimentValidationError):
+            parse_duplex_trace(stale, prefix_frames=2)
+
     def test_duplex_rejects_barge_in_but_tolerates_boundary_slop(self):
         tolerance = interface_fit.DUPLEX_ONSET_TOLERANCE_FRAMES
         # Opening a frame or two before the encoder formally consumed the
@@ -248,6 +287,72 @@ class SupervisionTests(unittest.TestCase):
             opened=True, onset=interface_fit.DUPLEX_MAX_ONSET_FRAMES + 1, spoken=9))
         # A turn that opened and then said nothing supervises nothing.
         self.assertTrue(duplex_turn_rejections(opened=True, onset=4, spoken=0))
+
+    def test_free_running_turn_opens_on_content_and_not_on_a_stray_eos(self):
+        class ScriptedLM:
+            """Decodes a fixed token sequence, so only the loop is under test."""
+
+            fusion_weights = {"text": 1.0, "audio": 1.0, "function": 2.0}
+            fuse = FrozenVoiceChatLM.fuse
+
+            def __init__(self, script):
+                self.script, self.step = list(script), 0
+
+            def embed(self, ids):
+                return ids[..., None].float().expand(*ids.shape, 2)
+
+            def __call__(self, inputs, *, prefix=None, return_state=False):
+                return (inputs, prefix) if return_state else inputs
+
+            def head(self, hidden):
+                token = self.script[min(self.step, len(self.script) - 1)]
+                self.step += 1
+                logits = torch.full((hidden.shape[0], 64), -10.0)
+                logits[:, token] = 10.0
+                return logits
+
+        proj = torch.nn.Linear(2, 2)
+        cached = torch.ones(16, 2)
+        timeline = {"text_tokens": [12] * 6, "function_tokens": [12] * 6,
+                    "audio_indices": interface_fit.duplex_audio_indices(6)}
+        # Pad, pad, pad, then two content tokens and a stop: the command runs
+        # out after frame 2, so this turn opens one frame past it.
+        run = interface_fit.duplex_free_run(proj, ScriptedLM([12, 12, 12, 42, 43, 2]), cached,
+                                            timeline, None, command_frames=2)
+        self.assertTrue(run["opened"])
+        self.assertEqual(run["onset_frames_past_command"], 1)
+        self.assertEqual(run["reply_token_ids"], [42, 43])
+        # It stops at the EOS that closes its own turn rather than decoding
+        # the whole silence tail.
+        self.assertEqual(run["frames_decoded"], 6)
+        # An EOS while no turn is open closes nothing and opens nothing, which
+        # is the bug that made every free-running turn end at frame 9.
+        silent = interface_fit.duplex_free_run(proj, ScriptedLM([12, 2, 12, 12, 12, 12]), cached,
+                                               timeline, None, command_frames=2)
+        self.assertFalse(silent["opened"])
+        self.assertIsNone(silent["onset_frames_past_command"])
+        self.assertEqual(silent["frames_decoded"], 6)
+
+    def test_duplex_gate_needs_a_control_that_speaks_and_a_fit_that_still_does(self):
+        control = {"A": {"n": 24, "opened": 24, "onsets": [4] * 24},
+                   "B": {"n": 24, "opened": 24, "onsets": [5] * 24}}
+        # The v1 pilot: teacher-forced cross-entropy was fine, and free running
+        # it answered none of the turns its own initialization answered.
+        silent = {"A": {"n": 24, "opened": 0, "onsets": []},
+                  "B": {"n": 24, "opened": 0, "onsets": []}}
+        self.assertFalse(interface_fit.duplex_gate_verdict(silent, control)["passed"])
+        matching = {"A": {"n": 24, "opened": 24, "onsets": [6] * 24},
+                    "B": {"n": 24, "opened": 23, "onsets": [6] * 23}}
+        verdict = interface_fit.duplex_gate_verdict(matching, control)
+        self.assertTrue(verdict["passed"])
+        self.assertTrue(verdict["control_calibrated"])
+        self.assertEqual(verdict["cells"]["B"]["fitted_onsets_in_band"], 23)
+        # A control that cannot open a turn either says the harness is broken,
+        # so a matching fit is not evidence of anything.
+        mute_control = {cell: {**value, "opened": 0, "onsets": []} for cell, value in control.items()}
+        useless = interface_fit.duplex_gate_verdict(silent, mute_control)
+        self.assertFalse(useless["control_calibrated"])
+        self.assertFalse(useless["passed"])
 
     def test_english_gate_fails_a_single_regressed_prompt_cell(self):
         initialization = {"B1/en/A_english_only": {"n": 100, "mean": .40},

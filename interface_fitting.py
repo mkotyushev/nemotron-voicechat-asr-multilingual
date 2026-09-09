@@ -214,6 +214,120 @@ def cache_encoders(args):
             torch.cuda.empty_cache()
 
 
+def duplex_cache_geometry(root: Path, tail_frames: int) -> dict:
+    """How much silence the cache has to carry, and who needs it.
+
+    B1's timeline runs to whatever the runtime streamed; B2's runs to the end
+    of its own reply.  Sizing the tail by the larger of the two is the whole
+    of it -- there is no per-clip trimming here, because silence embeddings do
+    not settle to a shared steady state (still ~0.6 away at k=128, and cosine
+    0.85-0.995 between clips), so a shared tail would be a different tail.
+    """
+    b1 = read_frozen(root / "targets" / "B1-duplex" / "provenance.json")
+    longest, counted = 0, 0
+    for path in sorted((root / "targets" / "B2").glob("*-*.json")):
+        reply = read_frozen(path).get("reply_token_ids")
+        if reply:
+            # BOS, the reply, EOS, and the ten pad frames that train the return
+            # to listening.
+            longest = max(longest, len(reply) + 12)
+            counted += 1
+    needed = max(int(b1["tail_frames"]), longest)
+    if tail_frames < needed:
+        raise ExperimentValidationError(
+            f"a {tail_frames}-frame silence tail is short of the {needed} frames "
+            f"B1 ({b1['tail_frames']}) and B2 ({longest}) timelines reach")
+    return {"lead_frames": int(b1["lead_frames"]), "tail_frames": int(tail_frames),
+            "b1_tail_frames": int(b1["tail_frames"]), "b2_longest_reply_frames": longest,
+            "b2_targets_measured": counted,
+            "b1_duplex_provenance_sha256": stable_json_sha256(b1)}
+
+
+def cache_duplex_encoders(args):
+    """Cache each clip the way the bridge streams it: silence, command, silence.
+
+    The v1 cache holds the command alone and the timelines marked every frame
+    past it -1, which `duplex_inputs` turned into an exact zero embedding.
+    That is what `vc_session::run_turn` passes once the wav is spent; it is not
+    what deployment does.  `bridge/server.py::_audio_loop` advances the model
+    on silence, so the model hears ENCODED silence, and a projection fitted
+    against the zero waits for a cue that never arrives -- the v1 pilot
+    answered 22 of 24 on a zero tail and 0 of 24 on the encoded one.
+
+    The tensors are large and go to `--activation-root`; the provenance and
+    the index stay beside the experiment so the fit still verifies every byte.
+    """
+    from safetensors.torch import save_file
+
+    experiment, data = load_experiment(args.output)
+    dataset_b.verify_audio(data)
+    geometry = duplex_cache_geometry(args.output, args.tail_frames)
+    lead, tail = geometry["lead_frames"], geometry["tail_frames"]
+    block = gating.DuplexPerceptionEngine.FRAME_SAMPLES
+    LOG.info("duplex cache: %d lead + command + %d tail frames (B1 %d, B2 %d)",
+             lead, tail, geometry["b1_tail_frames"], geometry["b2_longest_reply_frames"])
+    for arm in args.arm or dataset_b.ARMS:
+        index_root = args.output / "activations-duplex" / arm
+        tensor_root = args.activation_root / arm
+        state = arm_weights(experiment, arm)
+        digest = final_map.encoder_byte_digest(state)
+        header = {"arm": arm, "encoder": digest, "source": experiment["sources"][arm],
+                  "dataset_b_sha256": data["manifest_sha256"],
+                  "runtime_configuration": experiment["runtime_configuration"],
+                  "activation_precision": "F32", "inference_precision": "F32; TF32 disabled",
+                  "padding": "lead silence, command zero padded to a whole 80ms block, tail silence",
+                  # The cache keeps every frame the encoder produced; which of
+                  # them a streamed frame lines up with is the timeline's
+                  # choice at fit time, not a property of these bytes.
+                  "tensor_root": str(args.activation_root.resolve()), **geometry}
+        write_frozen(index_root / "provenance.json", header)
+        model = encoder.build(state).to(args.device)
+        saved = []
+        rows = [r for split in data["splits"].values() for r in split]
+        for position, row in enumerate(rows):
+            key = row["clip_id"].replace("/", "-")
+            path = tensor_root / f"{key}.safetensors"
+            sidecar = index_root / f"{key}.json"
+            expected = {"clip_id": row["clip_id"], "audio_sha256": row["sha256"],
+                        "provenance_sha256": stable_json_sha256(header)}
+            if sidecar.exists():
+                entry = read_frozen(sidecar)
+                if any(entry[k] != v for k, v in expected.items()):
+                    raise ExperimentValidationError(f"cached duplex activation provenance changed: {key}")
+                verify_record(entry["activation"])
+            else:
+                if path.exists():
+                    raise ExperimentValidationError(f"duplex activation without provenance: {path}")
+                import soundfile
+                samples, rate = soundfile.read(manifests.resolve_take(Path(data["root"]), row), dtype="float32")
+                if rate != features.SAMPLE_RATE:
+                    raise ExperimentValidationError(f"{row['clip_id']}: {rate} Hz, not the frozen featurizer's rate")
+                blocks = -(-len(samples) // block)
+                padded = np.zeros((lead + blocks + tail) * block, dtype="float32")
+                padded[lead * block:lead * block + len(samples)] = samples
+                mel = features.log_mel(torch.from_numpy(padded), state["featurizer.fb"],
+                                       state["featurizer.window"]).float()
+                with torch.no_grad():
+                    hidden = model(mel[None].to(args.device))[0].float().cpu().contiguous()
+                if not torch.isfinite(hidden).all():
+                    raise ExperimentValidationError(f"non-finite cached duplex encoder output: {key}")
+                if hidden.shape[0] != features.frames_out(padded.size):
+                    raise ExperimentValidationError(f"duplex cache frame count moved: {key}")
+                tensor_root.mkdir(parents=True, exist_ok=True)
+                index_root.mkdir(parents=True, exist_ok=True)
+                save_file({"hidden": hidden}, path)
+                entry = write_frozen(sidecar, {**expected, "activation": record(path),
+                                               "shape": list(hidden.shape), "command_blocks": blocks})
+            saved.append(entry)
+            if position % 100 == 0:
+                LOG.info("%s duplex encoder clips %d/%d", arm, position + 1, len(rows))
+        write_frozen(index_root / "index.json", {**header, "clips": saved})
+        del model, state
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def tokenizer(experiment):
     from tokenizers import Tokenizer
     verify_record(experiment["tokenizer"])
@@ -361,7 +475,10 @@ def target_audio_duplex(args):
               "rules": ["the model opens its own turn: duplex_step clears want_bos and hold_bos",
                         "reject a turn opened more than the tolerance before the command ended",
                         "after the command the model hears encoded silence, never a zero embedding"],
-              "frame_trace": "VC_DUMP=1; original text and function tokens at every 80ms frame"}
+              "frame_trace": "VC_DUMP=1; original text and function tokens at every 80ms frame",
+              "trace_slicing": ("the turn is the last contiguous run from the system prompt's last "
+                                "frame; a byte-offset slice can open with the previous turn's "
+                                "block-buffered stderr")}
     output = args.output / "targets" / "B1-duplex"
     write_frozen(output / "provenance.json", header)
     identifier, quality = gating.fit_language_identifier(args.massive)
@@ -432,6 +549,16 @@ def target_audio_duplex(args):
         engine.close()
 
 
+def target_directory(args, pool: str) -> str:
+    """Which recorded pool a run supervises B1 from.
+
+    `B1` is the v1 whole-wav trace: forced BOS, barge-in suppressed, a zero
+    embedding past the command.  `B1-duplex` is the same clips regenerated on
+    the turn path deployment actually runs.
+    """
+    return args.b1_directory if pool == "B1" else pool
+
+
 def freeze_targets(args):
     experiment, data = load_experiment(args.output)
     entries, summary = [], {}
@@ -439,7 +566,8 @@ def freeze_targets(args):
         for row in rows:
             pair = []
             for condition in gating.SYSTEM_PROMPTS:
-                path = args.output / "targets" / row["pool"] / f"{row['clip_id'].replace('/', '-')}-{condition}.json"
+                path = (args.output / "targets" / target_directory(args, row["pool"])
+                        / f"{row['clip_id'].replace('/', '-')}-{condition}.json")
                 if not path.exists():
                     raise ExperimentValidationError(f"missing teacher target: {path}")
                 target = read_frozen(path)
@@ -455,20 +583,23 @@ def freeze_targets(args):
                                 "retained": retained, "target": file})
     if any(v["paired_retained"] == 0 for v in summary.values()):
         raise ExperimentValidationError("teacher filtering emptied a Dataset B language/prompt cell")
-    write_frozen(args.output / "targets" / "index.json", {
+    write_frozen(args.output / "targets" / args.targets_index, {
         "teacher_paths": data["teacher_paths"], "dataset_b_sha256": data["manifest_sha256"],
         "retention_rule": "retain a clip only if both prompt conditions pass the frozen gate",
-        "teacher_quality": summary, "entries": entries,
-        "provenance": {pool: record(args.output / "targets" / pool / "provenance.json") for pool in ("B1", "B2")}})
+        "b1_directory": args.b1_directory, "teacher_quality": summary, "entries": entries,
+        "provenance": {pool: record(args.output / "targets" / target_directory(args, pool) / "provenance.json")
+                       for pool in ("B1", "B2")}})
 
 
-def load_training_items(root, data, targets, budget, arm, *, split="train"):
+def load_training_items(root, data, targets, budget, arm, *, split="train",
+                        frame_offset=interface_fit.CACHE_FRAME_OFFSET):
     from safetensors.torch import load_file
     allowed = set(dataset_b.budget_clip_ids(data, budget)) if split == "train" else {r["clip_id"] for r in data["splits"][split]}
     rows = {r["clip_id"]: r for r in data["splits"][split]}
-    cache = read_frozen(root / "activations" / arm / "index.json")
+    cache = read_frozen(root / "activations-duplex" / arm / "index.json")
     if cache["dataset_b_sha256"] != data["manifest_sha256"]:
         raise ExperimentValidationError("encoder cache uses another training manifest")
+    lead = int(cache["lead_frames"])
     cached = {r["clip_id"]: r for r in cache["clips"]}
     items = []
     for entry in targets["entries"]:
@@ -480,9 +611,29 @@ def load_training_items(root, data, targets, budget, arm, *, split="train"):
         activation = cached[key]
         verify_record(activation["activation"])
         hidden = load_file(activation["activation"]["path"])["hidden"]
-        timeline = target["timeline"] if rows[key]["pool"] == "B1" else text_target_timeline(target["reply_token_ids"], len(hidden))
+        blocks = int(activation["command_blocks"])
+        if rows[key]["pool"] == "B1":
+            # The trace begins at the bridge's first frame, so it covers the
+            # lead silence too and indexes the cache from its own start.
+            if int(target["lead_frames"]) != lead:
+                raise ExperimentValidationError(f"{key}: teacher and cache disagree on the lead silence")
+            # The runtime acknowledged one encoder frame per streamed block; if
+            # it did not, the cache is not the audio the teacher heard.
+            if int(target["command_encoder_frames"]) - lead != blocks:
+                raise ExperimentValidationError(
+                    f"{key}: the teacher consumed {int(target['command_encoder_frames']) - lead} command "
+                    f"frames where the cache holds {blocks} blocks")
+            timeline = dict(target["timeline"])
+            command_frames = int(target["command_encoder_frames"])
+            timeline["audio_indices"] = interface_fit.duplex_audio_indices(
+                len(timeline["text_tokens"]), offset=frame_offset)
+        else:
+            timeline = text_target_timeline(target["reply_token_ids"], blocks,
+                                            lead_frames=lead, offset=frame_offset)
+            command_frames = blocks
         items.append({"clip_id": key, "condition": entry["condition"], "pool": rows[key]["pool"],
-                      "language": rows[key]["language"], "features": hidden, "timeline": timeline})
+                      "language": rows[key]["language"], "features": hidden, "timeline": timeline,
+                      "command_frames": command_frames})
     return items, cache
 
 
@@ -490,7 +641,7 @@ def fit(args):
     from safetensors.torch import load_file, save_file
     experiment, data = load_experiment(args.output)
     fitting_graph = validate_fitting_graph(experiment)
-    targets = read_frozen(args.output / "targets/index.json")
+    targets = read_frozen(args.output / "targets" / args.targets_index)
     if targets["dataset_b_sha256"] != data["manifest_sha256"]:
         raise ExperimentValidationError("teacher targets use another Dataset B")
     if args.arm != "E1":
@@ -501,8 +652,10 @@ def fit(args):
     output = args.output / "fits" / f"{args.arm}-{args.budget}-{args.precision}"
     if (output / "result.json").exists():
         raise ExperimentValidationError("fit is already frozen; choose a new experiment for changed settings")
-    items, cache = load_training_items(args.output, data, targets, args.budget, args.arm)
-    validation, _ = load_training_items(args.output, data, targets, args.budget, args.arm, split="validation")
+    items, cache = load_training_items(args.output, data, targets, args.budget, args.arm,
+                                       frame_offset=args.frame_offset)
+    validation, _ = load_training_items(args.output, data, targets, args.budget, args.arm,
+                                        split="validation", frame_offset=args.frame_offset)
     if not items or not validation:
         raise ExperimentValidationError("empty training or validation selection")
     LOG.info("%s %d%% %s: %d training and %d validation clip/prompt examples; verifying source checkpoint",
@@ -639,6 +792,29 @@ def scored_cells(projection, lm, items, prefixes, device) -> dict:
     return {key: {"n": len(values), "mean": sum(values) / len(values)} for key, values in cells.items()}
 
 
+def duplex_cells(projection, lm, items, prefixes, device) -> dict:
+    """Free-running turn taking, one cell per prompt condition.
+
+    `scored_cells` measures teacher-forced cross-entropy, which the v1
+    projection passed while answering nothing in deployment.  This measures
+    whether the projection still decides to speak when nothing is fed back to
+    it, under the three conditions the Realtime bridge imposes.
+    """
+    cells: dict[str, dict] = {}
+    for item in items:
+        result = interface_fit.duplex_free_run(
+            projection, lm, item["features"].to(device), item["timeline"],
+            prefixes[item["condition"]], command_frames=item["command_frames"])
+        cell = cells.setdefault(item["condition"], {"n": 0, "opened": 0, "onsets": [], "silent": []})
+        cell["n"] += 1
+        cell["opened"] += int(result["opened"])
+        if result["opened"]:
+            cell["onsets"].append(int(result["onset_frames_past_command"]))
+        else:
+            cell["silent"].append(item["clip_id"])
+    return cells
+
+
 def english_gate(args):
     """The control every other arm waits on: did fitting break the loop?"""
 
@@ -646,11 +822,12 @@ def english_gate(args):
 
     experiment, data = load_experiment(args.output)
     validate_fitting_graph(experiment)
-    targets = read_frozen(args.output / "targets/index.json")
+    targets = read_frozen(args.output / "targets" / args.targets_index)
     if targets["dataset_b_sha256"] != data["manifest_sha256"]:
         raise ExperimentValidationError("teacher targets use another Dataset B")
     fit_root, result, _ = read_fit(args.output, "E1", args.budget, args.precision)
-    validation, cache = load_training_items(args.output, data, targets, args.budget, "E1", split="validation")
+    validation, cache = load_training_items(args.output, data, targets, args.budget, "E1",
+                                           split="validation", frame_offset=args.frame_offset)
     english = [item for item in validation if item["pool"] == "B1"]
     if not english:
         raise ExperimentValidationError("the English gate needs held-out B1 clips")
@@ -665,27 +842,47 @@ def english_gate(args):
     prefixes = {condition: lm.cache_prompt([1, *tok.encode(prompt, add_special_tokens=False).ids, 2])
                 for condition, prompt in gating.SYSTEM_PROMPTS.items()}
     fitted = load_file(result["projection"]["path"])
+    initial_projection = linear_from(source["proj.weight"], source["proj.bias"], args.device)
+    fitted_projection = linear_from(fitted["proj.weight"], fitted["proj.bias"], args.device)
     # The initialization is E1's own untouched FT_EN projection, so this is the
     # design record's "trained proj against original proj on English" exactly.
     measured = {
-        "initialization": scored_cells(linear_from(source["proj.weight"], source["proj.bias"], args.device),
-                                       lm, english, prefixes, args.device),
-        "fitted": scored_cells(linear_from(fitted["proj.weight"], fitted["proj.bias"], args.device),
-                               lm, english, prefixes, args.device),
+        "initialization": scored_cells(initial_projection, lm, english, prefixes, args.device),
+        "fitted": scored_cells(fitted_projection, lm, english, prefixes, args.device),
     }
     verdict = english_gate_verdict(measured["fitted"], measured["initialization"], tolerance=args.tolerance)
+    # Teacher forcing hides the one thing the pilot got wrong, so the gate does
+    # not stop at cross-entropy: it also runs the turn free, with the untouched
+    # projection alongside as the control that says the harness works.
+    LOG.info("E1 duplex control: free running %d held-out clip/prompt examples under both projections",
+             len(english))
+    duplex = {
+        "initialization": duplex_cells(initial_projection, lm, english, prefixes, args.device),
+        "fitted": duplex_cells(fitted_projection, lm, english, prefixes, args.device),
+    }
+    duplex_verdict = interface_fit.duplex_gate_verdict(
+        duplex["fitted"], duplex["initialization"], tolerance=args.open_rate_tolerance)
     value = write_frozen(args.output / "E1_english_gate.json",
                          {"arm": "E1", "budget": args.budget, "precision": args.precision,
                           "experiment_sha256": experiment["manifest_sha256"],
                           "dataset_b_sha256": data["manifest_sha256"],
                           "fit_result": record(fit_root / "result.json"),
                           "projection": dict(result["projection"]), "encoder": cache["encoder"],
-                          "measured": measured, **verdict})
+                          "frame_offset": args.frame_offset,
+                          "measured": measured, "duplex_measured": duplex,
+                          "duplex": duplex_verdict,
+                          **verdict, "passed": bool(verdict["passed"] and duplex_verdict["passed"])})
     LOG.info("E1 English gate %s: %+.5f nats against the initialization over %d held-out clip/prompt examples",
-             "passed" if value["passed"] else "FAILED", value["delta"], value["clips_scored"])
+             "passed" if verdict["passed"] else "FAILED", value["delta"], value["clips_scored"])
+    LOG.info("E1 duplex gate %s: opened %.1f%% of turns against the initialization's %.1f%%%s",
+             "passed" if duplex_verdict["passed"] else "FAILED",
+             100 * duplex_verdict["fitted_open_rate"], 100 * duplex_verdict["initialization_open_rate"],
+             "" if duplex_verdict["control_calibrated"] else " (CONTROL DID NOT OPEN EVERY TURN)")
     if not value["passed"]:
         raise ExperimentValidationError(
-            "E1 did not match its initialization on English; the fitting loop is broken")
+            "E1 did not match its initialization on English; the fitting loop is broken"
+            if not verdict["passed"] else
+            "E1 lost its ability to open a duplex turn; the fit would be silent in deployment")
 
 
 def export_artifact(args):
@@ -872,6 +1069,13 @@ def main():
     cache = sub.add_parser("cache")
     cache.add_argument("--arm", choices=dataset_b.ARMS, action="append")
     cache.set_defaults(run=cache_encoders)
+    duplex_cache = sub.add_parser("cache-duplex")
+    duplex_cache.add_argument("--arm", choices=dataset_b.ARMS, action="append")
+    duplex_cache.add_argument("--tail-frames", type=int, default=213)
+    # The padded runs are an order of magnitude larger than the command-only
+    # cache; /srv/fast has no room for them.
+    duplex_cache.add_argument("--activation-root", type=Path, required=True)
+    duplex_cache.set_defaults(run=cache_duplex_encoders)
     target = sub.add_parser("targets-text")
     target.add_argument("--endpoint", required=True)
     target.add_argument("--teacher-model", type=Path, required=True)
@@ -901,6 +1105,7 @@ def main():
     duplex.set_defaults(run=target_audio_duplex)
     freeze = sub.add_parser("freeze-targets")
     freeze.set_defaults(run=freeze_targets)
+    freeze.add_argument("--b1-directory", choices=("B1", "B1-duplex"), default="B1-duplex")
     train = sub.add_parser("fit")
     train.add_argument("--arm", choices=dataset_b.ARMS, required=True)
     train.add_argument("--budget", type=int, choices=dataset_b.BUDGETS, required=True)
@@ -914,6 +1119,8 @@ def main():
     verdict.add_argument("--budget", type=int, choices=dataset_b.BUDGETS, default=100)
     verdict.add_argument("--precision", choices=("nf4", "bf16_cpu_offload"), default="nf4")
     verdict.add_argument("--tolerance", type=float, default=interface_fit.GATE_TOLERANCE_NATS)
+    verdict.add_argument("--open-rate-tolerance", type=float,
+                         default=interface_fit.DUPLEX_OPEN_RATE_TOLERANCE)
     verdict.set_defaults(run=english_gate)
     artifact = sub.add_parser("export")
     artifact.add_argument("--arm", choices=dataset_b.ARMS, required=True)
@@ -928,7 +1135,12 @@ def main():
     evaluate.add_argument("--deployment", type=Path, required=True)
     evaluate.add_argument("--batch", type=int, default=4)
     evaluate.set_defaults(run=evaluate_artifact)
-    for command in (prep, cache, target, audio, duplex, freeze, train, verdict, artifact, evaluate):
+    for command in (freeze, train, verdict):
+        command.add_argument("--targets-index", default="index-B1-duplex.json")
+    for command in (train, verdict):
+        command.add_argument("--frame-offset", type=int, default=interface_fit.CACHE_FRAME_OFFSET)
+    for command in (prep, cache, duplex_cache, target, audio, duplex, freeze, train, verdict,
+                    artifact, evaluate):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--device", default="cuda")
         command.add_argument("--threads", type=int, default=12)
