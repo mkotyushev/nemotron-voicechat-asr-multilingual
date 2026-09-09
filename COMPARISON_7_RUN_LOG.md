@@ -287,6 +287,47 @@ model opens a turn at all. It answers in about 6 GPU minutes what previously
 took a 3.5 h fit, an export and a container pilot to discover, and it would
 have blocked v1.
 
+## Teacher generation throughput: 4.5x from not paying twice for the card
+
+B1's original 17.7 hours were not a model limit. `-n-gpu-layers 24` was chosen
+so the exec'd `voicechat-cli` could coexist with the container's own bridge
+server, which holds about 14.6 GB. But the STT LM has **56 layers**, so 32 of
+them (57%) were running on CPU, and the bridge is dead weight during target
+generation: it serves nothing while B1 execs its own binary with an explicit
+`--mmproj`.
+
+Running the container with an idle entrypoint instead of the bridge frees the
+whole card, and `-ngl 99` then fits comfortably:
+
+| | Median turn | Per 80 ms frame |
+|---|---:|---:|
+| `-ngl 24`, bridge resident | 19.41 s | 225.7 ms |
+| `-ngl 99`, bridge stopped | **4.34 s** | **45.7 ms** |
+
+```bash
+docker compose --env-file .cache/experiments/voice-assistant-pilot-v2/runtime.env \
+  -f /tmp/nemotron-voicechat-main-229dc0e/docker-compose.yml down
+docker run -d --name nemotron-voicechat --gpus all \
+  -v /srv/bulk/ai/models/NemotronLabs-VoiceChat-11B-gguf:/models:ro \
+  --tmpfs /tmp:size=1g -e VC_MODEL_DIR=/models -e VC_NO_BARGE=1 \
+  -e VC_FORCE_BOS=1 -e VC_QUIET=10 --entrypoint sleep \
+  nemotron-voicechat:f45001fc3d8013c72beb6753d3eb0b976b6a9fff infinity
+```
+
+The container keeps its name and image, so `_container_provenance` records what
+it always did. Restore the bridge with `docker rm -f nemotron-voicechat` and the
+usual `docker compose up -d voicechat`.
+
+**That is the available headroom, and the rest is not worth taking.** A worker
+holds 12.36 GB, so two do not fit in 24 GB, and the KV cache is not what fills
+it: cutting `--session-seconds` from 180 to 40, which is still far more than the
+~240 frame turns need, saved 46 MiB. GPU utilisation sits at 35-47% because the
+loop is serialised per frame -- one JSON command over `docker exec` stdin, a
+streaming encode of 1280 samples, a single-token decode over 56 layers, one
+event back -- not because the card is saturated. Pipelining the command frames
+might recover 10-15%, but writing many frames without draining stdout risks a
+pipe deadlock, which is a poor trade against a run of this length.
+
 ## Open items the next session should not rediscover
 
 - **The runtime has two turn paths and this experiment straddles them.**
