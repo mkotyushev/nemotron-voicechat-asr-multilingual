@@ -264,12 +264,12 @@ recorded decision before any arm is refit. Running the command below unchanged
 would be expected to reproduce the silent pilot at a cost of about 3.5 GPU
 hours plus export and evaluation.
 
-The decisions are now taken and implemented; what is left is the order below.
-B1 is regenerating on the duplex path, and the two stages after it cannot start
-until it finishes, because each needs the whole card.
+All four stages below have now run, in this order, 2026-09-09 23:00 to
+2026-09-10 08:48. E1 passed both halves of its gate. They need the whole card
+each, so they cannot overlap -- see the contention entry further down.
 
 ```bash
-# 1. B1 on the turn path deployment runs (in flight, ~4 h, one GPU)
+# 1. B1 on the turn path deployment runs (~4.5 h, one GPU)
 .venv-align/bin/python interface_fitting.py targets-audio-duplex \
   --massive .cache/datasets/MASSIVE/1.1/data --n-gpu-layers 99 \
   --output .cache/experiments/comparison-7-interface-v2-fusion
@@ -296,7 +296,14 @@ Retention while B1 runs, and the frame-accounting check the cache depends on:
 
 ```bash
 .venv-align/bin/python .cache/experiments/comparison-7-b1-duplex-progress.py
+.venv-align/bin/python .cache/experiments/comparison-7-b1-duplex-validate.py
 ```
+
+Stage costs as measured, for planning the other three arms: B1 teacher 4.5 h,
+`cache-duplex` 8 minutes of encoding behind an 8-minute checkpoint load, the
+fit 3.4 h, the gate 46 minutes of which 36 is free running. E2-E4 each need
+their own `cache-duplex` (7.3 GB, and `fit` blocks them until E1's gate passes,
+which it now has).
 
 The three diagnostics behind that hold need no server and about 25 GPU minutes
 in total. They read only frozen artifacts and write only into `analysis/`:

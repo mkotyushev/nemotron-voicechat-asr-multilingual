@@ -530,6 +530,49 @@ sound one instead of returning a meaningless pass. Free running costs about
 4.7 s an example, so the full gate over 303 held-out targets under two
 projections is roughly 45 minutes.
 
+## The corrected E1 refit, and both halves of its gate
+
+Fitted 2026-09-10 04:36 to 08:01 on the regenerated pool: 2,428 optimiser steps
+over 9,712 clip/prompt examples, budget 100%, NF4, two epochs, and the fusion
+weights the original recipe specifies — `{audio: 1.0, function: 2.0, text: 1.0}`
+— so the function-token weight defect is closed in the artifact and not only in
+the code.
+
+**Held-out cross-entropy, against E1's own untouched projection.**
+
+| Cell | n | Initialization | Fitted | Delta |
+|---|---:|---:|---:|---:|
+| `B1/en/A_english_only` | 135 | 0.22830 | 0.21016 | **−0.01814** |
+| `B1/en/B_input_language` | 135 | 0.23429 | 0.19678 | **−0.03751** |
+| overall | 270 | 0.23129 | 0.20347 | **−0.02783** |
+
+Both cells improve rather than merely holding inside the 0.05-nat tolerance,
+which is what E1 starting at its own teacher's answer should look like when the
+loop is sound.
+
+**Free running, under the three deployment conditions.** This is the half that
+did not exist for v1, and the half that matters.
+
+| Cell | n | Init open rate | Fitted open rate | Init onset | Fitted onset | In band |
+|---|---:|---:|---:|---:|---:|---:|
+| `A_english_only` | 135 | 1.000 | 0.993 | +2 | **+4** | 134/135 |
+| `B_input_language` | 135 | 1.000 | 1.000 | +2 | **+4** | 135/135 |
+
+The control is calibrated — the untouched projection opened 270 of 270 — so the
+fitted result means something. **269 of 270**, against v1's 0 of 24 on the same
+kind of check. One turn in the English-only cell stays silent.
+
+The onset is the part worth reading twice. The initialization opens at a median
+of +2 frames; the fitted projection opens at **+4**, which is the duplex
+teacher's own median over the retained pool. The fit did not merely avoid going
+silent — it moved the turn-taking toward the teacher's timing, which is the
+behaviour the v1 forced BOS was destroying and the reason the teacher was
+regenerated at all.
+
+Recorded in `E1_english_gate.json`, which carries both verdicts, the per-cell
+measurements, the projection and encoder digests, and the frame offset the
+timelines were built at.
+
 ## Two preconditions the refit had beyond the teacher, both now met
 
 Regenerating B1 fixed the supervision but not the graph that consumes it.
