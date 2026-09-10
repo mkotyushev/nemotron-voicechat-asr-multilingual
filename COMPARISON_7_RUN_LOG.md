@@ -473,6 +473,101 @@ Backing out cost nothing, which was the point of trying it: the stage is
 resumable per clip, and it writes its `provenance.json` only after the encoder
 digest it never reached, so no partial artifact was left behind.
 
+## Where the run is, and what a fresh session needs to know
+
+E1 is fitted and has passed both halves of its gate (2026-09-10 08:48). E2, E3
+and E4 are unblocked and unstarted. Everything below is on branch
+`worktree-comparison-7-interface-fitting`.
+
+**Which directories are live, and which are superseded.** This is the thing
+most easily got wrong, because the superseded ones are not deleted:
+
+| Path under the v2 experiment | Status |
+|---|---|
+| `targets/B1-duplex/` | **live.** 2,033 clips, 4,066 targets, the duplex pool everything is fitted against |
+| `targets/B2/` | **live.** Unchanged text-teacher pool |
+| `targets/index-B1-duplex.json` | **live** frozen index. `fit`/`gate` default to it |
+| `activations-duplex/E1/` + `/srv/bulk/ai/data/comparison-7/activations-duplex/E1/` | **live.** Sidecars here, 7.3 GB of tensors there |
+| `fits/E1-100-nf4/`, `E1_english_gate.json`, `loss_calibration.json` | **live** |
+| `targets/B1/` | superseded. The v1 `run_turn` pool; its zero tail is why the pilot was silent |
+| `targets/index.json` | superseded. The v1 frozen index over `targets/B1` |
+| `targets/B1-duplex-prebugfix/` | superseded. The partial first duplex run, before the trace-slicing fix |
+| `targets-duplex-check48/`, `-lead0/`, `-lead8/` | superseded subset checks that sized the recipe |
+| `activations/` | superseded. The command-only cache with no silence tail |
+
+`duplex_inputs` now refuses a timeline containing a `-1`, so the superseded
+pools cannot be fitted by accident -- they raise rather than train something
+wrong.
+
+**The next arm is two commands.** `fit` blocks non-E1 arms until E1's gate
+passes, which it now has. Each needs the whole card; see the contention entry
+below.
+
+```bash
+ARM=E2   # then E3, E4
+.venv-align/bin/python interface_fitting.py cache-duplex --arm $ARM \
+  --activation-root /srv/bulk/ai/data/comparison-7/activations-duplex \
+  --output .cache/experiments/comparison-7-interface-v2-fusion
+.venv-align/bin/python interface_fitting.py fit --arm $ARM --budget 100 \
+  --precision nf4 --epochs 2 --learning-rate 0.0003 --accumulate 8 --seed 0 \
+  --output .cache/experiments/comparison-7-interface-v2-fusion
+```
+
+`freeze-targets` does not need re-running: the frozen index is arm independent.
+Budget on the measured E1 costs -- `cache-duplex` 8 minutes of encoding behind
+an 8-minute checkpoint load and 7.3 GB, `fit` 3.4 h, `gate` 46 minutes.
+
+**The container is not in the state compose leaves it in.** Teacher generation
+runs 4.5x faster without the bridge server, so the compose service was replaced
+by a bare idle container of the same name and image:
+
+```bash
+docker run -d --name nemotron-voicechat --gpus all \
+  -v /srv/bulk/ai/models/NemotronLabs-VoiceChat-11B-gguf:/models:ro \
+  --tmpfs /tmp:size=1g -e VC_MODEL_DIR=/models -e VC_NO_BARGE=1 \
+  -e VC_FORCE_BOS=1 -e VC_QUIET=10 --entrypoint sleep \
+  nemotron-voicechat:f45001fc3d8013c72beb6753d3eb0b976b6a9fff infinity
+```
+
+It is still running as `sleep infinity`. Anything that needs the Realtime
+bridge -- a deployment pilot, `/v1/realtime` -- must put the compose service
+back first (`docker rm -f nemotron-voicechat`, then the `docker compose up`
+line further up this file). `docker exec` of `llama-voicechat` works either
+way, which is all the teacher stages need.
+
+**The helper scripts are untracked, and live outside the worktree** in
+`.cache/experiments/` (a symlink to the shared store on `/srv/fast`), so they
+survive the worktree being removed but are invisible to version control. The
+ones worth knowing:
+
+- `comparison-7-b1-duplex-progress.py` -- retention, onsets and the
+  frame-accounting check; safe to run against a pool mid-generation
+- `comparison-7-b1-duplex-validate.py` -- retention per cell, budget survival,
+  and the duplex-vs-v1 teacher divergence
+- `comparison-7-b1-missing.py` -- which clips a stage has not produced yet
+- `comparison-7-gate-control-check.py N` -- free-runs the untouched projection
+  on N held-out examples; the cheap pre-flight before committing to a fit
+- `comparison-7-load-items-check.py` -- asserts every fit timeline is
+  contiguous, in bounds and hearing audio
+- `comparison-7-cache-duplex-dryrun.py` -- geometry and padding without the GPU
+- `comparison-7-trace-fix-reparse.py` -- re-scores a pool from stored traces,
+  which is how a parser change is measured before regenerating anything
+
+**Three open questions this run did not close.**
+
+1. **The frame offset is measured to within half a frame, not pinned.**
+   `CACHE_FRAME_OFFSET = 1` follows from the frontend arithmetic and nothing
+   contradicts it, but 40 ms either way is not excluded. `fit` and `gate` take
+   `--frame-offset`, and a fit at 0 into a separate `--output` compared on
+   held-out cross-entropy would settle it. Cheap relative to what it de-risks
+   for the other three arms.
+2. **One held-out turn in 270 stays silent** under the fitted projection, in
+   the English-only cell. Not enough to fail the gate and not yet looked at.
+3. **The deployment pilot has not been re-run.** The gate free-runs the student
+   in PyTorch; it does not exercise the exported artifact through the Realtime
+   bridge. That is still the endpoint check, and it needs the compose service
+   back.
+
 ## Open items the next session should not rediscover
 
 - **The runtime has two turn paths and this experiment straddles them.**
@@ -513,10 +608,9 @@ digest it never reached, so no partial artifact was left behind.
   the pools one after the other, and stop the text teacher before fitting.
 - **B1 is the long pole, not B2.** 2,033 clips under two prompts is 4,066
   runtime turns, each streaming its audio and then decoding, against B2's
-  ~14 hours. Budget for it before starting. Its `VC_DUMP=1` frame trace, which
-  `parse_audio_trace` needs and which `asr_align/gating.py` injects, is present
-  in the pinned runtime (`voicechat-cli.cpp` emits the `DUMP t=… txt=… fn=…`
-  line the parser matches), so the path is supported but unexercised.
+  ~14 hours. Budget for it before starting. The `VC_DUMP=1` frame trace both
+  parsers need is emitted by the pinned runtime and is now well exercised: the
+  duplex pool was regenerated from it end to end.
 - **The precision variable is unmeasured.** Every fit records its
   language-model precision, but the NF4-versus-bf16 gap invariant 3 asks for
   has not been run.
